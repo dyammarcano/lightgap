@@ -21,11 +21,16 @@ The measured numbers, not aspirational ones.
 
 | Receiver's camera | Bytes per frame |
 |---|---|
-| 720p (laptop, desktop webcam) | 586 |
-| 1080p (phone, tablet) | 1465 |
+| 720p (laptop, desktop webcam) | 271 |
+| 1080p (phone, tablet) | 644 |
 
-At roughly ten frames per second that is 6–15 KB/s. **A 5 MB file takes minutes,
-not seconds.** This is a tool for keys and configuration, not for video.
+At roughly ten frames per second that is 2.7-6.4 KB/s. **A 5 MB file takes tens
+of minutes.** This is a tool for keys and configuration, not for video.
+
+Those figures come from a measured pixels-per-module threshold under realistic
+capture conditions. An earlier pass measured the same threshold under ideal
+conditions and got numbers roughly twice as good; they were real, and they
+described a capture with no blur, no noise and no tilt, which is not a capture.
 
 Camera resolution is the dominant lever: per-frame payload grows with the
 *square* of linear resolution, whereas raising the frame rate scales linearly and
@@ -48,6 +53,7 @@ crates/
   acoustic-codec/     2-FSK modulation, framing, calibration, synthetic impairment
   link-calibration/   probe ladders, goodput scoring, adaptive control
   channel-sim/        lossy channel for testing the core without hardware
+  modem/              the transfer engine: all of the above, composed
 tauri-app/            desktop and mobile application
 ```
 
@@ -85,8 +91,16 @@ cargo test -p optical-codec --test device -- --nocapture
 # Where the acoustic channel gives out.
 cargo test -p acoustic-codec --test acoustic -- --nocapture
 
-# How many camera pixels per QR module are actually needed.
+# How many camera pixels per QR module are actually needed, under ideal,
+# typical and harsh capture.
 cargo run -p optical-codec --example threshold
+```
+
+The engine itself is exercised end to end without hardware, including one test
+that renders real QR codes and photographs them with the synthetic camera:
+
+```bash
+cargo test -p modem -- --nocapture
 ```
 
 ## How it works
@@ -134,10 +148,15 @@ exchange is security theatre.
 
 ## Status
 
-The protocol core, optical codec, calibration, acoustic codec, multiplexer and
-pairing are implemented and tested. The application wiring that connects them to
-real cameras and speakers is the remaining work, and it is gated on the Phase 0
-measurement, which needs hardware.
+The protocol core, optical codec, calibration, acoustic codec, multiplexer,
+pairing and the transfer engine are implemented and tested. Two modems move a
+real file end to end — over a channel losing 70% of frames, and separately
+through real QR codes photographed by the synthetic camera — with no hardware
+involved.
+
+What remains is the Tauri adapter: turning camera frames into engine calls and
+engine output into a code on screen. That is gated on the Phase 0 measurement,
+which needs two physical devices.
 
 ## License
 

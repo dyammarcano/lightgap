@@ -11,6 +11,20 @@ fn payload(n: usize) -> Vec<u8> {
 }
 
 fn main() {
+    // The threshold is not one number: it depends on the capture conditions,
+    // and measuring it only under ideal ones understates what a real link needs.
+    for (name, base) in [
+        ("ideal", Conditions::ideal()),
+        ("typical", Conditions::typical()),
+        ("harsh", Conditions::harsh()),
+    ] {
+        println!();
+        println!("=== {name} conditions ===");
+        sweep(&base);
+    }
+}
+
+fn sweep(base: &Conditions) {
     // Bins of 0.5 px/module between 2 and 12.
     let mut ok = [0u32; 20];
     let mut total = [0u32; 20];
@@ -24,7 +38,7 @@ fn main() {
             let fill = 0.15 + step as f32 * 0.009;
             let cond = Conditions {
                 fill,
-                ..Conditions::ideal()
+                ..base.clone()
             };
             let (w, h, px) = capture(&m, &cond);
             let scan = scan_greyscale(w, h, &px);

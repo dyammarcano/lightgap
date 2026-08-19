@@ -1,10 +1,11 @@
 //! How the code sits inside the frame.
 //!
 //! This feeds the alignment guidance in the UI. The measure that dominates is
-//! `pixels_per_module`: below about six pixels per module — a measured figure,
-//! see [`MIN_PIXELS_PER_MODULE`] — the detector starts failing no matter how
-//! well centred the code is, and no other adjustment compensates. That is why
-//! "move closer" is almost always the right advice when something is wrong.
+//! `pixels_per_module`: below about eight and a half pixels per module — a
+//! measured figure, see [`MIN_PIXELS_PER_MODULE`] — the detector starts failing
+//! no matter how well centred the code is, and no other adjustment compensates.
+//! That is why "move closer" is almost always the right advice when something is
+//! wrong.
 
 /// A point in frame coordinates.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -107,25 +108,43 @@ impl QrGeometry {
     }
 }
 
-/// Pixels per module at which reading becomes reliable.
+/// Pixels per module at which reading becomes reliable **in real conditions**.
 ///
-/// **Measured, not assumed.** Sweeping fractional scales through the synthetic
-/// camera (`cargo run -p optical-codec --example threshold`):
+/// **Measured, not assumed** — and measured twice, because the first
+/// measurement was wrong in an instructive way. Sweeping fractional scales
+/// through the synthetic camera
+/// (`cargo run -p optical-codec --example threshold`):
 ///
-/// | px/module | read rate |
-/// |---|---|
-/// | 2.0-3.0 | 24-40% |
-/// | 3.0-6.0 | 60-87% |
-/// | 6.0+    | ~100%  |
+/// | px/module | ideal capture | typical capture |
+/// |---|---|---|
+/// | 2.0-3.0 | 24-40% | 0% |
+/// | 3.0-6.0 | 60-87% | 10-67% |
+/// | 6.0-7.0 | 91-100% | 64-65% |
+/// | 7.0-8.5 | 93-100% | 64-94% |
+/// | 8.5+    | 100%   | 100%  |
 ///
-/// The standard quotes 2 as an absolute minimum, but that number assumes a grid
-/// aligned to the pixel. A camera scales fractionally, module edges land
-/// mid-pixel, and the detector — which samples the module centre — gets
-/// confused. Twice the theoretical minimum is what reality costs.
+/// The first pass measured only the ideal column and concluded 6.0. That number
+/// is real but describes a capture with no blur, no noise and no tilt, which is
+/// not a capture. Under conditions a webcam on a desk actually produces, the
+/// same 6.0 px/module reads barely two frames in three — and a link dropping a
+/// third of its frames is not a link, it is a retry loop.
+///
+/// The standard quotes 2 as an absolute minimum. That assumes a grid aligned to
+/// the pixel; a camera scales fractionally, module edges land mid-pixel, and the
+/// detector — which samples the module centre — gets confused. Four times the
+/// theoretical minimum is what reality costs.
 ///
 /// Practical consequence: at 720p with the code filling 70% of the height, about
-/// 84 modules fit, which is roughly 450 B per frame at correction level Q.
-pub const MIN_PIXELS_PER_MODULE: f32 = 6.0;
+/// 59 modules fit, which is roughly 270 B per frame at correction level L.
+pub const MIN_PIXELS_PER_MODULE: f32 = 8.5;
+
+/// What suffices when the capture really is clean — a still device, good light,
+/// displays square to each other.
+///
+/// Kept as a separate constant rather than folded into the one above because
+/// calibration can discover that a particular link is this good and push
+/// density accordingly. What it must not do is *assume* it.
+pub const IDEAL_PIXELS_PER_MODULE: f32 = 6.0;
 
 /// Below this, reading fails more often than it succeeds.
 ///

@@ -264,15 +264,24 @@ fn the_advice_prioritises_what_actually_blocks() {
         assert_eq!(advise(&g, scan.sharpness), Advice::MoveCloser);
     }
 
-    // Good framing: no complaints.
+    // Good framing: no complaints. A sparser code than the one above, because
+    // 200 B at correction Q is 65 modules, which even at fill 0.7 over 720p only
+    // reaches about 6.9 px/module — below the measured threshold, so "move
+    // closer" is the correct advice there rather than a false alarm.
+    let sparse = encode(&payload(100), Ecc::Q).unwrap();
     let good = Conditions {
         fill: 0.7,
         ..Conditions::ideal()
     };
-    let (w, h, px) = capture(&modules, &good);
+    let (w, h, px) = capture(&sparse, &good);
     let scan = scan_greyscale(w, h, &px);
     let g = scan.best_geometry().expect("seen");
-    assert_eq!(advise(&g, scan.sharpness), Advice::Ok);
+    assert_eq!(
+        advise(&g, scan.sharpness),
+        Advice::Ok,
+        "a framing that clears the threshold must not be nagged at ({:.1} px/module)",
+        g.pixels_per_module
+    );
 }
 
 #[test]

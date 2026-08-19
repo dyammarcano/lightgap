@@ -320,7 +320,23 @@ impl FountainReceiver {
     /// possibility of the two sides splitting the object differently.
     #[must_use]
     pub fn from_oti_bytes(oti: &[u8; 12]) -> Self {
-        Self::from_config(ObjectTransmissionInformation::deserialize(oti))
+        let config = ObjectTransmissionInformation::deserialize(oti);
+        // The same empty-object guard as `new`. It has to be here too: this is
+        // the path the transfer engine actually takes, since it builds the
+        // receiver from the sender's transmitted plan rather than from a length.
+        // Guarding only one of the two constructors left the real path exposed.
+        if config.transfer_length() == 0 {
+            return Self {
+                decoder: None,
+                symbol_size: config.symbol_size(),
+                source_symbols: 0,
+                received: 0,
+                object: Some(Vec::new()),
+                complete: true,
+                taken: false,
+            };
+        }
+        Self::from_config(config)
     }
 
     fn from_config(config: ObjectTransmissionInformation) -> Self {
@@ -432,5 +448,38 @@ impl Receiver for FountainReceiver {
             have: u64::from(self.received.min(self.source_symbols)),
             need: u64::from(self.source_symbols),
         }
+    }
+}
+
+/// A summary rather than a dump.
+///
+/// Deriving `Debug` here would print the encoder, which holds the entire object
+/// — several megabytes of it in a realistic transfer. What a person debugging
+/// actually wants is the state: how big the symbols are, how many the object
+/// needs, how many have gone out, and whether the peer has confirmed.
+impl core::fmt::Debug for FountainSender {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("FountainSender")
+            .field("symbol_size", &self.symbol_size)
+            .field("source_symbols", &self.source_symbols)
+            .field("emitted", &self.emitted)
+            .field("peer_received", &self.peer_received)
+            .field("pending", &self.pending.len())
+            .field("complete", &self.complete)
+            .finish()
+    }
+}
+
+/// A summary rather than a dump, for the same reason as the sender: the decoder
+/// accumulates the whole object.
+impl core::fmt::Debug for FountainReceiver {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("FountainReceiver")
+            .field("symbol_size", &self.symbol_size)
+            .field("source_symbols", &self.source_symbols)
+            .field("received", &self.received)
+            .field("complete", &self.complete)
+            .field("taken", &self.taken)
+            .finish()
     }
 }

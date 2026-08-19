@@ -250,40 +250,52 @@ The strategy is that **almost everything is testable without two devices**:
 These numbers were not in the original design. They came out of measuring, and
 some of them contradict assumptions the design took for granted.
 
-### Pixels per module: six, not three
+### Pixels per module: eight and a half, not three — and not six either
 
 Sweep over the synthetic camera
 (`cargo run -p optical-codec --example threshold`):
 
-| px/module | read rate |
-|---|---|
-| 2.0-3.0 | 24-40% |
-| 3.0-6.0 | 60-87% |
-| 6.0+    | ~100%  |
+| px/module | ideal capture | typical capture |
+|---|---|---|
+| 2.0-3.0 | 24-40% | 0% |
+| 3.0-6.0 | 60-87% | 10-67% |
+| 6.0-7.0 | 91-100% | 64-65% |
+| 7.0-8.5 | 93-100% | 64-94% |
+| 8.5+    | 100%   | 100%  |
 
 The standard gives 2 as an absolute minimum, but it assumes a grid aligned to the
-pixel. A camera scales fractionally, module edges land mid-pixel and the detector
-gets confused. **Twice the theoretical minimum is what reality costs.**
+pixel. A camera scales fractionally and the detector gets confused.
+
+**The instructive part is that this was measured wrong once.** The first pass
+swept only the ideal column and concluded 6.0. That number is real, and it
+describes a capture with no blur, no noise and no tilt — which is not a capture.
+At 6.0 px/module under conditions a webcam on a desk actually produces, barely
+two frames in three read, and a link dropping a third of its frames is a retry
+loop rather than a link.
+
+It surfaced when the end-to-end optical test never converged: control frames read
+perfectly and data frames never did, at 7.0 px/module — comfortably above the
+threshold that had been recorded. Taking a measurement in the favourable case and
+treating it as the general number is a method error, not an arithmetic one, and
+it is worth naming because it is easy to repeat.
 
 ### Real per-frame capacity at 720p
 
 Payload that decodes **reliably** (every repetition), with the code filling 75% of
-the height:
+the height, sized from the corrected 8.5 px/module threshold:
 
-| correction | reliable bytes per frame |
-|---|---|
-| L | 500 |
-| M | 400 |
-| Q | 200 |
-| H | 200 |
+| receiver | modules | bytes per frame |
+|---|---|---|
+| 720p (laptop, desktop webcam) | 57 | 271 |
+| 1080p (phone, tablet) | 85 | 644 |
 
-The design assumed about 900 B. The difference matters: at 10 QR codes per second
-that is 2-5 KB/s, so **a 5 MB file would take between 17 and 40 minutes**. Worth
-telling the user before starting, not halfway through.
+The design assumed about 900 B. At 10 frames per second the corrected figures are
+2.7-6.4 KB/s, so **a 5 MB file takes between 13 and 31 minutes**. Worth telling
+the user before starting, not halfway through.
 
-Mind the distinction between "decodes once" and "decodes every time": at 3.3
-px/module, 1200 B fit *sometimes*. Negotiating on that number would produce a
-profile that fails one frame in four.
+Mind the distinction between "decodes once" and "decodes every time", and the
+one between ideal and realistic capture. Both mistakes inflate the number, and
+both were made here before being caught.
 
 ### Measured pairing table
 
@@ -292,10 +304,10 @@ hardware (`cargo test -p optical-codec --test device -- --nocapture`):
 
 | Receiver's camera | Modules resolvable | Bytes per frame |
 |---|---|---|
-| 720p (laptop, desktop webcam) | 81 | 586 |
-| 1080p (phone, tablet) | 125 | 1465 |
+| 720p (laptop, desktop webcam) | 57 | 271 |
+| 1080p (phone, tablet) | 85 | 644 |
 
-**A 2.5x difference from the receiver's camera alone.** The sender's display
+**A 2.4x difference from the receiver's camera alone.** The sender's display
 stops mattering once it is large enough to draw the code the peer can resolve,
 which happens well before any modern display runs out of pixels.
 

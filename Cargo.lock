@@ -2755,6 +2755,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "modem"
+version = "0.1.0"
+dependencies = [
+ "blake3",
+ "channel-sim",
+ "link-calibration",
+ "optical-codec",
+ "optical-protocol",
+ "thiserror 2.0.20",
+]
+
+[[package]]
 name = "moxcms"
 version = "0.8.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
