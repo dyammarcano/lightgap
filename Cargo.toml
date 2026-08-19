@@ -3,7 +3,7 @@ resolver = "2"
 members = [
     "tauri-app",
     "tauri-app/src-tauri",
-    # crates/* se añaden a medida que cada fase los crea
+    "crates/optical-protocol",
 ]
 
 [workspace.package]
