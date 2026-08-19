@@ -12,8 +12,10 @@
 
 pub mod channel;
 pub mod reliability;
+pub mod session;
 pub mod wire;
 
 pub use channel::{Channel, ChannelCaps, ChannelError, ChannelHealth, ChannelId, Direction};
 pub use reliability::{Feedback, Mode, Progress, Receiver, RecvError, Sender, Symbol};
+pub use session::{Event, PeerId, Role, Session, State};
 pub use wire::{Flags, Pdu, PduKind, WireError, MAX_PAYLOAD, OVERHEAD, PROTOCOL_VERSION};
