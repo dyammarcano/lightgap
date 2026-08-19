@@ -18,3 +18,6 @@ keystore.properties
 
 /.tauri
 /tauri.settings.gradle
+# Build outputs. The APK is 193 MB in debug and is reproducible from source.
+/app/build
+/app/src/main/jniLibs

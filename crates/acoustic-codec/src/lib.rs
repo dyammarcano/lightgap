@@ -20,10 +20,12 @@
 //! a question for calibration to answer per device pair, not for this crate to
 //! assume.
 
+pub mod calibration;
 pub mod framing;
 pub mod fsk;
 pub mod impair;
 
+pub use calibration::{assign_bands, BandMeasurement, BandPlan, Viability};
 pub use framing::{Framer, FramingError};
 pub use fsk::{demodulate, modulate, AcousticProfile, Demodulated};
 pub use impair::{impair, Impairment};
