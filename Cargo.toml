@@ -6,6 +6,7 @@ members = [
     "crates/optical-protocol",
     "crates/channel-sim",
     "crates/optical-codec",
+    "crates/link-calibration",
 ]
 
 [workspace.package]

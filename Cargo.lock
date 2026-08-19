@@ -2501,6 +2501,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "link-calibration"
+version = "0.1.0"
+dependencies = [
+ "optical-protocol",
+]
+
+[[package]]
 name = "linux-raw-sys"
 version = "0.12.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
