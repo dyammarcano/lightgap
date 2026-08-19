@@ -1,0 +1,29 @@
+[workspace]
+resolver = "2"
+members = [
+    "tauri-app",
+    "tauri-app/src-tauri",
+    # crates/* se añaden a medida que cada fase los crea
+]
+
+[workspace.package]
+edition = "2021"
+license = "MIT"
+
+[workspace.dependencies]
+# Compartidas entre crates. Las específicas de una fase viven en su crate.
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+
+[profile.release]
+codegen-units = 1
+lto = true
+opt-level = 3
+panic = "abort"
+strip = true
+
+# El decode de QR y el DSP de audio corren en debug durante el desarrollo.
+# Sin esto son demasiado lentos para evaluar el enlace de forma realista.
+[profile.dev.package."*"]
+opt-level = 2
