@@ -10,6 +10,10 @@
 //! viaja. Añadir el canal acústico, LEDs o un socket TCP es implementar un
 //! trait, no editar esta capa.
 
+pub mod channel;
+pub mod reliability;
 pub mod wire;
 
+pub use channel::{Channel, ChannelCaps, ChannelError, ChannelHealth, ChannelId, Direction};
+pub use reliability::{Feedback, Mode, Progress, Receiver, RecvError, Sender, Symbol};
 pub use wire::{Flags, Pdu, PduKind, WireError, MAX_PAYLOAD, OVERHEAD, PROTOCOL_VERSION};
