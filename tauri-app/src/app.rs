@@ -57,6 +57,57 @@ const DISPLAY_INTERVAL_MS: u32 = 40;
 /// How often the status panel refreshes.
 const STATUS_INTERVAL_MS: u32 = 250;
 
+/// The video inputs this machine offers, as (device id, label).
+///
+/// Labels come back blank until camera permission has been granted at least
+/// once — a page is not told what hardware is attached before then. The
+/// numbered fallback keeps the list usable on a first run, and the list is read
+/// again once a stream is open so the real names replace it.
+async fn enumerate_cameras() -> Vec<(String, String)> {
+    let Ok(devices) = window().navigator().media_devices() else {
+        return Vec::new();
+    };
+    let Ok(promise) = devices.enumerate_devices() else {
+        return Vec::new();
+    };
+    let Ok(list) = JsFuture::from(promise).await else {
+        return Vec::new();
+    };
+
+    let mut found: Vec<(String, String)> = Vec::new();
+    for item in js_sys::Array::from(&list).iter() {
+        let info: web_sys::MediaDeviceInfo = item.unchecked_into();
+        if info.kind() != web_sys::MediaDeviceKind::Videoinput {
+            continue;
+        }
+        let label = info.label();
+        let label = if label.is_empty() {
+            format!("Camera {}", found.len() + 1)
+        } else {
+            label
+        };
+        found.push((info.device_id(), label));
+    }
+    found
+}
+
+/// Hands the camera back to the system.
+///
+/// Clearing the video element is not enough on its own: the tracks keep
+/// running, the capture light stays lit, and the device stays held. That reads
+/// as merely untidy right up until the moment someone picks a different camera,
+/// at which point the old one was never released and the new one cannot open.
+fn release_stream(video: &web_sys::HtmlVideoElement) {
+    if let Some(source) = video.src_object() {
+        let stream: web_sys::MediaStream = source.unchecked_into();
+        for track in stream.get_tracks().iter() {
+            let track: web_sys::MediaStreamTrack = track.unchecked_into();
+            track.stop();
+        }
+    }
+    video.set_src_object(None);
+}
+
 #[derive(Debug, Clone, Default, Deserialize)]
 struct Metrics {
     frames_captured: u64,
@@ -148,6 +199,30 @@ fn percent(v: f32) -> String {
     format!("{:.0}%", (v * 100.0).clamp(0.0, 100.0))
 }
 
+/// A secondary control.
+const BTN: &str = "min-h-10 cursor-pointer rounded-lg border border-line bg-panel px-3.5 \
+                   text-sm text-ink transition-colors hover:border-beam \
+                   disabled:cursor-default disabled:opacity-35 disabled:hover:border-line";
+
+/// The one control that starts the link. There is exactly one primary action on
+/// this screen, and it is the one nothing else works without.
+const BTN_PRIMARY: &str = "min-h-10 cursor-pointer rounded-lg border border-gold/50 bg-gold/15 \
+                           px-3.5 text-sm font-medium text-gold transition-colors \
+                           hover:border-gold hover:bg-gold/25 \
+                           disabled:cursor-default disabled:opacity-35 \
+                           disabled:hover:border-gold/50 disabled:hover:bg-gold/15";
+
+/// One line of the live measurement panel.
+#[component]
+fn Metric(label: &'static str, #[prop(into)] value: Signal<String>) -> impl IntoView {
+    view! {
+        <div class="flex items-baseline justify-between gap-3 py-1">
+            <span class="text-dim">{label}</span>
+            <span class="font-semibold tabular-nums text-ink">{move || value.get()}</span>
+        </div>
+    }
+}
+
 #[component]
 pub fn App() -> impl IntoView {
     let video_ref: NodeRef<leptos::html::Video> = NodeRef::new();
@@ -159,6 +234,8 @@ pub fn App() -> impl IntoView {
     let (message, set_message) = signal(String::new());
     let (capture_ms, set_capture_ms) = signal(0.0f64);
     let (transport_ms, set_transport_ms) = signal(0.0f64);
+    let (cameras, set_cameras) = signal(Vec::<(String, String)>::new());
+    let (camera_id, set_camera_id) = signal(Option::<String>::None);
 
     // --- the displayed code -------------------------------------------------
     spawn_local(async move {
@@ -183,7 +260,13 @@ pub fn App() -> impl IntoView {
     });
 
     // --- the camera ---------------------------------------------------------
-    let start_camera = move |_| {
+    // Read up front, so the picker is populated before the camera is ever
+    // opened rather than only after.
+    spawn_local(async move {
+        set_cameras.set(enumerate_cameras().await);
+    });
+
+    let open_camera = move || {
         if camera_on.get_untracked() {
             return;
         }
@@ -203,10 +286,22 @@ pub fn App() -> impl IntoView {
             let video_cfg = Object::new();
             let _ = Reflect::set(&video_cfg, &"width".into(), &JsValue::from(CAPTURE_W));
             let _ = Reflect::set(&video_cfg, &"height".into(), &JsValue::from(CAPTURE_H));
-            // The rear camera when there is one. On a phone it is far better
-            // than the front camera and it is the one that will be aimed at the
-            // peer; on a laptop this is simply ignored.
-            let _ = Reflect::set(&video_cfg, &"facingMode".into(), &"environment".into());
+            // An explicitly chosen device wins. facingMode is only a hint, and
+            // on a desktop with several cameras attached it selects nothing at
+            // all — which is the case the picker exists for. It stays as the
+            // fallback because on a phone it is the right default: the rear
+            // camera is far better than the front one, and it is the one that
+            // gets aimed at the peer.
+            match camera_id.get_untracked() {
+                Some(id) => {
+                    let exact = Object::new();
+                    let _ = Reflect::set(&exact, &"exact".into(), &JsValue::from_str(&id));
+                    let _ = Reflect::set(&video_cfg, &"deviceId".into(), &exact.into());
+                }
+                None => {
+                    let _ = Reflect::set(&video_cfg, &"facingMode".into(), &"environment".into());
+                }
+            }
             let constraints = Object::new();
             let _ = Reflect::set(&constraints, &"video".into(), &video_cfg.into());
             let _ = Reflect::set(&constraints, &"audio".into(), &JsValue::FALSE);
@@ -238,6 +333,13 @@ pub fn App() -> impl IntoView {
             video.set_src_object(Some(&stream));
             let _ = video.play();
             set_message.set(String::new());
+
+            // Permission now exists, so the devices have readable names. Until
+            // this point the list held numbered placeholders.
+            let named = enumerate_cameras().await;
+            if !named.is_empty() {
+                set_cameras.set(named);
+            }
 
             let mut r_capture = Rolling::default();
             let mut r_transport = Rolling::default();
@@ -315,7 +417,36 @@ pub fn App() -> impl IntoView {
         });
     };
 
-    let stop_camera = move |_| set_camera_on.set(false);
+    let close_camera = move || {
+        set_camera_on.set(false);
+        if let Some(video) = video_ref.get_untracked() {
+            release_stream(&video);
+        }
+    };
+
+    let start_camera = move |_| open_camera();
+    let stop_camera = move |_| close_camera();
+
+    let pick_camera = move |ev| {
+        let chosen = event_target_value(&ev);
+        set_camera_id.set(if chosen.is_empty() {
+            None
+        } else {
+            Some(chosen)
+        });
+
+        // Switching while running has to close the old device first. The delay
+        // is not politeness: the capture loop needs a tick to notice it should
+        // stop, and a camera is not handed to the next caller the instant the
+        // last one lets go. Reopening immediately fails intermittently.
+        if camera_on.get_untracked() {
+            close_camera();
+            spawn_local(async move {
+                gloo_timers::future::TimeoutFuture::new(250).await;
+                open_camera();
+            });
+        }
+    };
 
     // --- file actions -------------------------------------------------------
     let pick_and_send = move |_| {
@@ -367,165 +498,274 @@ pub fn App() -> impl IntoView {
     };
 
     view! {
-        <main class="app">
-            <header class="bar">
-                <h1>"qr_comm"</h1>
-                <span class="state">
-                    {move || {
-                        let s = status.get();
-                        match s.role {
-                            Some(r) => format!("{} · {}", s.session_state, r),
-                            None => s.session_state,
-                        }
-                    }}
-                </span>
-                <span class="advice" class:good=move || status.get().peer_found>
-                    {move || status.get().advice}
-                </span>
-            </header>
+        <main class="min-h-screen bg-ground text-ink antialiased">
+            <div class="mx-auto flex max-w-6xl flex-col gap-4 p-4">
 
-            <section class="panes">
-                <div class="qr" inner_html=move || qr.get()></div>
+                <header class="flex flex-col gap-1">
+                    <div class="flex flex-wrap items-center gap-x-3 gap-y-1">
+                        <span class="h-3 w-3 shrink-0 rounded-full bg-gold"></span>
+                        <h1 class="text-base font-semibold tracking-wide">"Lightgap"</h1>
+                        <span
+                            class="rounded-full border border-line px-2 py-0.5 text-xs \
+                                   tabular-nums text-dim transition-colors"
+                            class=("border-verified/50", move || status.get().peer_found)
+                            class=("text-verified", move || status.get().peer_found)
+                        >
+                            {move || {
+                                let s = status.get();
+                                match s.role {
+                                    Some(r) => format!("{} · {}", s.session_state, r),
+                                    None => s.session_state,
+                                }
+                            }}
+                        </span>
+                    </div>
 
-                <div class="camera">
-                    <video node_ref=video_ref autoplay=true muted=true></video>
-                    <Show when=move || !camera_on.get()>
-                        <div class="camera-off">
-                            "Point this device's camera at the other one's screen"
+                    // Aiming guidance sits directly under the title because it
+                    // is the one line worth reading while holding two devices
+                    // up at each other.
+                    <p
+                        class="text-sm text-dim transition-colors"
+                        class=("text-verified", move || status.get().peer_found)
+                    >
+                        {move || status.get().advice}
+                    </p>
+                </header>
+
+                <section class="grid grid-cols-1 items-start gap-4 lg:grid-cols-[1.6fr_1fr]">
+
+                    <div class="flex flex-col gap-3">
+                        // White, always, and never tinted by the theme: this is
+                        // the transmitter, and its contrast IS the link's
+                        // signal-to-noise ratio.
+                        <div
+                            class="flex aspect-square items-center justify-center rounded-xl \
+                                   bg-white p-3 [&>svg]:block [&>svg]:h-full [&>svg]:w-full"
+                            inner_html=move || qr.get()
+                        ></div>
+
+                        <div class="flex flex-wrap gap-2">
+                            <button
+                                class=BTN_PRIMARY
+                                on:click=start_camera
+                                disabled=move || camera_on.get()
+                            >
+                                "Start camera"
+                            </button>
+                            <select
+                                class="min-h-10 max-w-56 cursor-pointer rounded-lg border \
+                                       border-line bg-panel px-2.5 text-sm text-ink \
+                                       transition-colors hover:border-beam"
+                                on:change=pick_camera
+                                prop:value=move || camera_id.get().unwrap_or_default()
+                            >
+                                <option value="">"Default camera"</option>
+                                {move || {
+                                    cameras
+                                        .get()
+                                        .into_iter()
+                                        .map(|(id, label)| {
+                                            view! { <option value=id>{label}</option> }
+                                        })
+                                        .collect_view()
+                                }}
+                            </select>
+                            <button
+                                class=BTN
+                                on:click=stop_camera
+                                disabled=move || !camera_on.get()
+                            >
+                                "Stop"
+                            </button>
                         </div>
-                    </Show>
-                </div>
-            </section>
 
-            <canvas node_ref=canvas_ref style="display:none"></canvas>
+                        <div class="flex flex-wrap gap-2">
+                            <button class=BTN on:click=pick_and_send>"Send a file…"</button>
+                            <button
+                                class=BTN
+                                on:click=save_received
+                                disabled=move || status.get().received_name.is_none()
+                            >
+                                "Save received…"
+                            </button>
+                            <button class=BTN on:click=reset>"Reset"</button>
+                        </div>
 
-            <section class="controls">
-                <button on:click=start_camera disabled=move || camera_on.get()>
-                    "Start camera"
-                </button>
-                <button on:click=stop_camera disabled=move || !camera_on.get()>
-                    "Stop camera"
-                </button>
-                <button on:click=pick_and_send>"Send a file…"</button>
-                <button
-                    on:click=save_received
-                    disabled=move || status.get().received_name.is_none()
-                >
-                    "Save received…"
-                </button>
-                <button on:click=reset>"Reset"</button>
-            </section>
+                        <Show when=move || !message.get().is_empty()>
+                            <p class="rounded border-l-2 border-beam bg-panel px-3 py-2 text-sm">
+                                {move || message.get()}
+                            </p>
+                        </Show>
 
-            <Show when=move || !message.get().is_empty()>
-                <p class="message">{move || message.get()}</p>
-            </Show>
+                        <Show when=move || status.get().sending.is_some()>
+                            <div class="flex items-center gap-3 text-sm">
+                                <span class="min-w-36 truncate text-dim">
+                                    "Sending "
+                                    {move || status.get().sending.unwrap_or_default()}
+                                </span>
+                                <progress
+                                    class="h-2 flex-1 accent-gold"
+                                    max="1"
+                                    value=move || status.get().send_progress
+                                ></progress>
+                                <span class="w-12 text-right tabular-nums text-dim">
+                                    {move || percent(status.get().send_progress)}
+                                </span>
+                            </div>
+                        </Show>
 
-            <section class="transfers">
-                <Show when=move || status.get().sending.is_some()>
-                    <div class="transfer">
-                        <span class="label">
-                            "Sending " {move || status.get().sending.unwrap_or_default()}
-                        </span>
-                        <progress max="1" value=move || status.get().send_progress></progress>
-                        <span class="pct">{move || percent(status.get().send_progress)}</span>
+                        <Show when=move || status.get().receiving.is_some()>
+                            <div class="flex items-center gap-3 text-sm">
+                                <span class="min-w-36 truncate text-dim">
+                                    "Receiving "
+                                    {move || status.get().receiving.unwrap_or_default()}
+                                </span>
+                                <progress
+                                    class="h-2 flex-1 accent-beam"
+                                    max="1"
+                                    value=move || status.get().receive_progress
+                                ></progress>
+                                <span class="w-12 text-right tabular-nums text-dim">
+                                    {move || percent(status.get().receive_progress)}
+                                </span>
+                            </div>
+                        </Show>
+
+                        <Show when=move || status.get().received_name.is_some()>
+                            <div
+                                class="rounded border-l-2 border-verified bg-panel px-3 py-2 \
+                                       text-sm"
+                            >
+                                {move || {
+                                    let s = status.get();
+                                    format!(
+                                        "{} arrived ({} B) — save it before resetting",
+                                        s.received_name.unwrap_or_default(),
+                                        s.received_len.unwrap_or(0),
+                                    )
+                                }}
+                            </div>
+                        </Show>
                     </div>
-                </Show>
 
-                <Show when=move || status.get().receiving.is_some()>
-                    <div class="transfer">
-                        <span class="label">
-                            "Receiving " {move || status.get().receiving.unwrap_or_default()}
-                        </span>
-                        <progress max="1" value=move || status.get().receive_progress></progress>
-                        <span class="pct">{move || percent(status.get().receive_progress)}</span>
+                    <div class="flex flex-col gap-3">
+                        // Not decoration: without it there is no way to tell
+                        // whether the peer's code is framed, in focus, or in
+                        // view at all.
+                        <div
+                            class="relative aspect-video overflow-hidden rounded-xl border \
+                                   border-line bg-black"
+                        >
+                            <video
+                                class="h-full w-full object-cover"
+                                node_ref=video_ref
+                                autoplay=true
+                                muted=true
+                            ></video>
+                            <Show when=move || !camera_on.get()>
+                                <div
+                                    class="absolute inset-0 flex items-center justify-center \
+                                           p-4 text-center text-sm text-dim"
+                                >
+                                    "Point this device's camera at the other one's screen"
+                                </div>
+                            </Show>
+                        </div>
+
+                        // Always visible rather than behind a panel. These
+                        // numbers are how anyone tells a link that is aimed
+                        // wrong from one that is aimed right and too dense.
+                        <div
+                            class="divide-y divide-line/60 rounded-xl border border-line \
+                                   bg-panel px-3 py-1 text-sm"
+                        >
+                            <Metric
+                                label="Read rate"
+                                value=Signal::derive(move || {
+                                    percent(status.get().metrics.decode_rate)
+                                })
+                            />
+                            <Metric
+                                label="Pixels per module"
+                                value=Signal::derive(move || {
+                                    format!("{:.1}", status.get().pixels_per_module)
+                                })
+                            />
+                            <Metric
+                                label="Payload per frame"
+                                value=Signal::derive(move || {
+                                    format!("{} B", status.get().payload_per_frame)
+                                })
+                            />
+                            <Metric
+                                label="Frames read"
+                                value=Signal::derive(move || {
+                                    let m = status.get().metrics;
+                                    format!("{} of {}", m.frames_decoded, m.frames_captured)
+                                })
+                            />
+                            // Its own row rather than folded into the one above:
+                            // seeing a code and failing to read it means the
+                            // density is too high or the focus is off, whereas
+                            // seeing none means nothing is aimed at this camera.
+                            // They call for opposite reactions.
+                            <Metric
+                                label="Seen but unread"
+                                value=Signal::derive(move || {
+                                    let m = status.get().metrics;
+                                    format!(
+                                        "{}",
+                                        m.frames_with_code.saturating_sub(m.frames_decoded),
+                                    )
+                                })
+                            />
+                            <Metric
+                                label="Capture"
+                                value=Signal::derive(move || {
+                                    format!("{:.1} ms", capture_ms.get())
+                                })
+                            />
+                            <Metric
+                                label="Transport"
+                                value=Signal::derive(move || {
+                                    format!("{:.1} ms", transport_ms.get())
+                                })
+                            />
+                            <Metric
+                                label="Scan"
+                                value=Signal::derive(move || {
+                                    format!("{:.1} ms", status.get().metrics.decode_ms)
+                                })
+                            />
+                            <Metric
+                                label="Codes displayed"
+                                value=Signal::derive(move || {
+                                    format!("{}", status.get().metrics.frames_displayed)
+                                })
+                            />
+                        </div>
                     </div>
-                </Show>
+                </section>
 
-                <Show when=move || status.get().received_name.is_some()>
-                    <div class="arrived">
+                <canvas node_ref=canvas_ref class="hidden"></canvas>
+
+                <details class="rounded-xl border border-line bg-panel px-3 py-2 text-sm">
+                    <summary class="cursor-pointer text-dim">"History"</summary>
+                    <ul class="mt-2 max-h-48 list-disc overflow-y-auto pl-5">
                         {move || {
-                            let s = status.get();
-                            format!(
-                                "{} arrived ({} B) — save it before resetting",
-                                s.received_name.unwrap_or_default(),
-                                s.received_len.unwrap_or(0),
-                            )
+                            status
+                                .get()
+                                .log
+                                .into_iter()
+                                .rev()
+                                .map(|line| {
+                                    view! { <li class="py-0.5 text-dim">{line}</li> }
+                                })
+                                .collect_view()
                         }}
-                    </div>
-                </Show>
-            </section>
-
-            <details class="link">
-                <summary>"Link"</summary>
-                <table>
-                    <tr>
-                        <td>"Payload per frame"</td>
-                        <td>{move || format!("{} B", status.get().payload_per_frame)}</td>
-                    </tr>
-                    <tr>
-                        <td>"Pixels per module"</td>
-                        <td>{move || format!("{:.1}", status.get().pixels_per_module)}</td>
-                    </tr>
-                    <tr>
-                        <td>"Frames read"</td>
-                        <td>
-                            {move || {
-                                let m = status.get().metrics;
-                                format!("{} of {}", m.frames_decoded, m.frames_captured)
-                            }}
-                        </td>
-                    </tr>
-                    <tr>
-                        <td>"Read rate"</td>
-                        <td>{move || percent(status.get().metrics.decode_rate)}</td>
-                    </tr>
-                    <tr>
-                        // Worth its own row rather than folded into the one
-                        // above: seeing a code and failing to read it means the
-                        // density is too high or the focus is off, whereas
-                        // seeing none means nothing is aimed at this camera.
-                        // They call for opposite reactions.
-                        <td>"Codes seen but unread"</td>
-                        <td>
-                            {move || {
-                                let m = status.get().metrics;
-                                format!("{}", m.frames_with_code.saturating_sub(m.frames_decoded))
-                            }}
-                        </td>
-                    </tr>
-                    <tr>
-                        <td>"Capture"</td>
-                        <td>{move || format!("{:.1} ms", capture_ms.get())}</td>
-                    </tr>
-                    <tr>
-                        <td>"Transport"</td>
-                        <td>{move || format!("{:.1} ms", transport_ms.get())}</td>
-                    </tr>
-                    <tr>
-                        <td>"Scan"</td>
-                        <td>{move || format!("{:.1} ms", status.get().metrics.decode_ms)}</td>
-                    </tr>
-                    <tr>
-                        <td>"Codes displayed"</td>
-                        <td>{move || format!("{}", status.get().metrics.frames_displayed)}</td>
-                    </tr>
-                </table>
-            </details>
-
-            <details class="history">
-                <summary>"History"</summary>
-                <ul>
-                    {move || {
-                        status
-                            .get()
-                            .log
-                            .into_iter()
-                            .rev()
-                            .map(|line| view! { <li>{line}</li> })
-                            .collect_view()
-                    }}
-                </ul>
-            </details>
+                    </ul>
+                </details>
+            </div>
         </main>
     }
 }

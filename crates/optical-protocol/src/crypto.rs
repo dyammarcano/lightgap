@@ -33,6 +33,14 @@ use crate::session::PeerId;
 /// Domain separation: derived material from this protocol must never coincide
 /// with material derived by anything else that happens to use the same shared
 /// secret.
+///
+/// These two deliberately still say `qr_comm` after the project was renamed to
+/// Lightgap. They are protocol constants, not branding. Every session key and
+/// every authentication string is derived through them, so changing the text
+/// changes the keys, and two builds that disagree on it cannot talk to each
+/// other at all — the failure looks like corruption, not like a rename. What
+/// they have to be is stable and unique, never on-brand. If they ever do
+/// change, bump `v1` in the same edit so the break is deliberate and visible.
 const KDF_CONTEXT: &str = "qr_comm v1 session key";
 /// Context string for the authentication string.
 const SAS_CONTEXT: &str = "qr_comm v1 short authentication string";

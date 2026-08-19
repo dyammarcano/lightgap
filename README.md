@@ -1,4 +1,4 @@
-# qr_comm
+# Lightgap
 
 An air-gapped multimodal modem. Two devices exchange files using only the
 hardware they already have — a display and a camera, and optionally a speaker

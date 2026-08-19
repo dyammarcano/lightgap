@@ -1,5 +1,5 @@
 [package]
-name = "tauri-app-ui"
+name = "lightgap-ui"
 version = "0.1.0"
 edition = "2021"
 
@@ -21,9 +21,12 @@ features = [
     "HtmlCanvasElement",
     "HtmlVideoElement",
     "ImageData",
+    "MediaDeviceInfo",
+    "MediaDeviceKind",
     "MediaDevices",
     "MediaStream",
     "MediaStreamConstraints",
+    "MediaStreamTrack",
     "Navigator",
     "Performance",
     "Window",

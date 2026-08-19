@@ -2636,6 +2636,37 @@ dependencies = [
 ]
 
 [[package]]
+name = "lightgap"
+version = "0.1.0"
+dependencies = [
+ "getrandom 0.3.4",
+ "modem",
+ "optical-codec",
+ "optical-protocol",
+ "serde",
+ "serde_json",
+ "tauri",
+ "tauri-build",
+ "tauri-plugin-dialog",
+ "tauri-plugin-opener",
+]
+
+[[package]]
+name = "lightgap-ui"
+version = "0.1.0"
+dependencies = [
+ "console_error_panic_hook",
+ "gloo-timers",
+ "js-sys",
+ "leptos",
+ "serde",
+ "serde-wasm-bindgen",
+ "wasm-bindgen",
+ "wasm-bindgen-futures",
+ "web-sys",
+]
+
+[[package]]
 name = "link-calibration"
 version = "0.1.0"
 dependencies = [
@@ -4672,37 +4703,6 @@ dependencies = [
  "webview2-com",
  "window-vibrancy",
  "windows",
-]
-
-[[package]]
-name = "tauri-app"
-version = "0.1.0"
-dependencies = [
- "getrandom 0.3.4",
- "modem",
- "optical-codec",
- "optical-protocol",
- "serde",
- "serde_json",
- "tauri",
- "tauri-build",
- "tauri-plugin-dialog",
- "tauri-plugin-opener",
-]
-
-[[package]]
-name = "tauri-app-ui"
-version = "0.1.0"
-dependencies = [
- "console_error_panic_hook",
- "gloo-timers",
- "js-sys",
- "leptos",
- "serde",
- "serde-wasm-bindgen",
- "wasm-bindgen",
- "wasm-bindgen-futures",
- "web-sys",
 ]
 
 [[package]]

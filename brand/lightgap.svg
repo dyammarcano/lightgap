@@ -1,0 +1,53 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- Lightgap mark: a mirror catching the sun, and the beam leaving it
+     across the gap.
+     Two shapes only, so it survives being shrunk to 16 px.
+
+     The beam is bounded GEOMETRICALLY — its far edge lands on the frame's
+     straight top edge (y=16, between the corner curves at x=112 and x=400).
+     Earlier drafts bounded it with a clip path and then with a gradient
+     fading to zero alpha; iconforge's rasterizer honours neither, and both
+     leaked a pale wedge outside the rounded corner. A mark must not depend
+     on a renderer's optional features.
+
+     The beam stays gold its whole length rather than fading toward the
+     ground. With stop-opacity ignored, a fade has to be baked into solid
+     colours, and desaturated gold over a dark ground reads as dirt rather
+     than as distance. Beam Blue lives on the mirror's shadow rim instead,
+     where it accents without muddying the one shape that has to survive
+     being 16 px wide, and in the mark it was cut for the same reason. -->
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" width="512" height="512">
+  <defs>
+    <linearGradient id="ground" x1="0" y1="0" x2="512" y2="512" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#2A3140"/>
+      <stop offset="1" stop-color="#171B24"/>
+    </linearGradient>
+
+    <linearGradient id="beam" x1="185" y1="330" x2="300" y2="16" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#F0B429"/>
+      <stop offset="1" stop-color="#A9741A"/>
+    </linearGradient>
+
+    <linearGradient id="core" x1="185" y1="330" x2="300" y2="16" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#FFF6E0"/>
+      <stop offset="1" stop-color="#F0B429"/>
+    </linearGradient>
+
+    <radialGradient id="mirror" cx="0.62" cy="0.34" r="0.82">
+      <stop offset="0"    stop-color="#FFF0C4"/>
+      <stop offset="0.42" stop-color="#F0B429"/>
+      <stop offset="1"    stop-color="#B77C12"/>
+    </radialGradient>
+  </defs>
+
+  <rect x="16" y="16" width="480" height="480" rx="96" ry="96" fill="url(#ground)"/>
+
+  <polygon points="185,330 230,16 370,16" fill="url(#beam)"/>
+  <polygon points="185,330 278,16 322,16" fill="url(#core)"/>
+
+  <!-- The mirror. Lit from the side the beam departs on. A dashed accent
+       rim was tried here and cut: at 32 px it read as a coin edge and
+       competed with the beam. The disc has to be a shape, not an outline. -->
+  <circle cx="168" cy="344" r="76" fill="url(#mirror)"/>
+  <circle cx="168" cy="344" r="76" fill="none" stroke="#FFF0C4" stroke-opacity="0.45" stroke-width="3"/>
+</svg>

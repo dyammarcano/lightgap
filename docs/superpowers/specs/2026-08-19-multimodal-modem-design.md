@@ -86,7 +86,7 @@ sketch):
 ### Crate layout
 
 ```
-qr_comm/
+lightgap/
 ├── Cargo.toml                 # [workspace]
 ├── crates/
 │   ├── optical-protocol/      # sans-io: PDU, session FSM, reliability, traits
@@ -95,7 +95,7 @@ qr_comm/
 │   ├── link-calibration/      # probe ladders, scoring, profiles. Pure logic
 │   └── channel-sim/           # lossy channel, for testing without hardware
 ├── tauri-app/
-│   ├── Cargo.toml             # tauri-app-ui (leptos/wasm)
+│   ├── Cargo.toml             # lightgap-ui (leptos/wasm)
 │   ├── src/                   # UI: QrDisplay, CameraPreview, AlignmentOverlay
 │   └── src-tauri/             # tauri-app: camera/audio drivers, commands, fs
 ```

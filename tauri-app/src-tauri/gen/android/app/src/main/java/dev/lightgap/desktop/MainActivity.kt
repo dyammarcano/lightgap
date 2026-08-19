@@ -1,4 +1,4 @@
-package dev.amber.desktop
+package dev.lightgap.desktop
 
 import android.os.Bundle
 import android.view.WindowManager

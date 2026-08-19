@@ -1,0 +1,19 @@
+@import "tailwindcss";
+
+/* Tailwind scans these for class names. Leptos keeps its markup in Rust, so
+   without the .rs glob every utility would be stripped as unused. */
+@source "./src/**/*.rs";
+@source "./index.html";
+
+/* The Heliograph palette from docs/BRANDING.md. */
+@theme {
+  --color-ground: #171b24;
+  --color-panel: #1f2430;
+  --color-line: #2e3545;
+  --color-ink: #e8e9ee;
+  --color-dim: #9099ab;
+  --color-gold: #f0b429;
+  --color-beam: #7aa2f7;
+  --color-verified: #6ee7a8;
+  --color-misread: #f2554b;
+}

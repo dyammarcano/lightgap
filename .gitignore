@@ -1,1 +1,7 @@
 /target/
+/dist/
+
+# Generated icon sets. Regenerate from the source mark with:
+#   iconforge forge --svg brand/lightgap.svg --name Lightgap --output build/icons --favicon
+# The mark itself lives in brand/ and is committed; these are its output.
+/build/
