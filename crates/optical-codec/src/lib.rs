@@ -6,11 +6,15 @@
 //! added without touching the transport layer.
 
 pub mod decode;
+pub mod device;
 pub mod distort;
 pub mod encode;
 pub mod geometry;
 
 pub use decode::{scan_greyscale, scan_pdus, Detection, FrameScan};
+pub use device::{
+    pair_profile, suggest_best_profile, FormFactor, VisualCapabilities, VisualProfile,
+};
 pub use distort::{capture, Conditions};
 pub use encode::{encode, max_payload, Ecc, EncodeError, Modules};
 pub use geometry::{advise, sharpness, Advice, Point, QrGeometry};

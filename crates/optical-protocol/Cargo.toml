@@ -8,6 +8,13 @@ description = "Sans-io core of the multimodal modem: wire format, session and re
 [dependencies]
 crc32fast = "1"
 raptorq = "2"
+
+# Phase 7, encrypted pairing. All pure Rust and no_std-capable, so they do not
+# compromise the sans-io core's portability.
+x25519-dalek = { version = "2", features = ["reusable_secrets", "getrandom"] }
+chacha20poly1305 = "0.10"
+blake3 = "1"
+getrandom = "0.3"
 thiserror.workspace = true
 
 [dev-dependencies]

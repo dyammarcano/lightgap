@@ -285,6 +285,28 @@ Mind the distinction between "decodes once" and "decodes every time": at 3.3
 px/module, 1200 B fit *sometimes*. Negotiating on that number would produce a
 profile that fails one frame in four.
 
+### Measured pairing table
+
+Per-frame capacity for each form-factor pairing, using each one's typical
+hardware (`cargo test -p optical-codec --test device -- --nocapture`):
+
+| Receiver's camera | Modules resolvable | Bytes per frame |
+|---|---|---|
+| 720p (laptop, desktop webcam) | 81 | 586 |
+| 1080p (phone, tablet) | 125 | 1465 |
+
+**A 2.5x difference from the receiver's camera alone.** The sender's display
+stops mattering once it is large enough to draw the code the peer can resolve,
+which happens well before any modern display runs out of pixels.
+
+This is what makes a phone-laptop pairing the best common combination and
+laptop-laptop the weakest: the former uses each device for its strength, the
+latter contributes a mediocre webcam at both ends.
+
+The profile is set by **my display and the peer's camera**, never by my own
+camera. Getting that backwards is an easy mistake and produces a link that is
+mysteriously worse in one direction; there is a test named after it.
+
 ### Camera resolution is the dominant lever
 
 Per-frame payload grows with the **square** of linear resolution, whereas raising
