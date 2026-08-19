@@ -286,16 +286,26 @@ the height, sized from the corrected 8.5 px/module threshold:
 
 | receiver | modules | bytes per frame |
 |---|---|---|
-| 720p (laptop, desktop webcam) | 57 | 271 |
-| 1080p (phone, tablet) | 85 | 644 |
+| 720p (laptop, desktop webcam) | 49 | 192 |
+| 1080p (phone, tablet) | 77 | 520 |
 
 The design assumed about 900 B. At 10 frames per second the corrected figures are
-2.7-6.4 KB/s, so **a 5 MB file takes between 13 and 31 minutes**. Worth telling
+1.9-5.2 KB/s, so **a 5 MB file takes between 16 and 44 minutes**. Worth telling
 the user before starting, not halfway through.
 
-Mind the distinction between "decodes once" and "decodes every time", and the
-one between ideal and realistic capture. Both mistakes inflate the number, and
-both were made here before being caught.
+This number has now been revised down three times, and every revision came from
+removing an optimistic assumption rather than from fixing a defect:
+
+1. "Decodes once" mistaken for "decodes every time". At 3.3 px/module 1200 B fit
+   *sometimes*; negotiating on that gives a profile failing one frame in four.
+2. The pixels-per-module threshold measured under ideal capture — no blur, no
+   noise, no tilt — and applied to real capture.
+3. The quiet zone not counted against the camera pixels it consumes, which makes
+   every profile optimistic by `(modules + 8) / modules`, about 14%.
+
+Each was individually reasonable and collectively they doubled the claimed
+throughput. The pattern worth naming: an optimistic model fails quietly, because
+its numbers look fine right up until the hardware disagrees.
 
 ### Measured pairing table
 
@@ -304,10 +314,10 @@ hardware (`cargo test -p optical-codec --test device -- --nocapture`):
 
 | Receiver's camera | Modules resolvable | Bytes per frame |
 |---|---|---|
-| 720p (laptop, desktop webcam) | 57 | 271 |
-| 1080p (phone, tablet) | 85 | 644 |
+| 720p (laptop, desktop webcam) | 49 | 192 |
+| 1080p (phone, tablet) | 77 | 520 |
 
-**A 2.4x difference from the receiver's camera alone.** The sender's display
+**A 2.7x difference from the receiver's camera alone.** The sender's display
 stops mattering once it is large enough to draw the code the peer can resolve,
 which happens well before any modern display runs out of pixels.
 

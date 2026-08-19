@@ -20,10 +20,19 @@ tauri-build = { version = "2", features = [] }
 [dependencies]
 tauri = { version = "2", features = [] }
 tauri-plugin-opener = "2"
+tauri-plugin-dialog = "2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+getrandom = "0.3"
 
-# PHASE 0 (throwaway spike): these go away with the spike if the hybrid path
-# does not pan out.
-rqrr = "0.9"
-qrcode = { version = "0.14", default-features = false, features = ["svg"] }
+# The whole stack below the application. Everything with a protocol decision in
+# it lives here rather than in the app, where it can be tested without hardware.
+modem = { path = "../../crates/modem" }
+optical-codec = { path = "../../crates/optical-codec" }
+optical-protocol = { path = "../../crates/optical-protocol" }
+
+[dev-dependencies]
+# The synthetic camera, so the engine can be exercised without a window or a
+# webcam. Testing the pacing and the frame path by launching the app and looking
+# at it would verify nothing repeatably.
+optical-codec = { path = "../../crates/optical-codec" }

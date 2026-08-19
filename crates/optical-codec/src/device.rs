@@ -106,6 +106,14 @@ impl VisualCapabilities {
     }
 }
 
+/// Quiet-zone modules on each side, as the standard requires.
+///
+/// Counted when sizing because it occupies camera pixels exactly like the code
+/// does. Ignoring it makes every profile optimistic by `(modules + 8) / modules`
+/// — about 14% at 57 modules — which is enough to put a link that the numbers
+/// say is comfortable below the threshold in practice.
+pub const QUIET_MODULES: u32 = 4;
+
 /// Fraction of the receiving camera's frame the code is expected to occupy once
 /// the user has framed it reasonably.
 ///
@@ -185,8 +193,10 @@ pub fn suggest_profile(
     let camera_px_on_code = peer.camera_square_px() as f32 * EXPECTED_FRAME_FILL;
 
     // How many modules those pixels can resolve, at the measured reliability
-    // threshold rather than the standard's theoretical minimum.
-    let resolvable_modules = (camera_px_on_code / MIN_PIXELS_PER_MODULE).floor() as u32;
+    // threshold rather than the standard's theoretical minimum — and counting
+    // the quiet zone, which consumes camera pixels just as the code does.
+    let resolvable_total = (camera_px_on_code / MIN_PIXELS_PER_MODULE).floor() as u32;
+    let resolvable_modules = resolvable_total.saturating_sub(QUIET_MODULES * 2);
 
     // My display also has to be able to draw them. This constraint is far weaker
     // — one pixel per module suffices to render — but on a small display showing
@@ -206,8 +216,8 @@ pub fn suggest_profile(
     // was never drawn, and unused display area is throughput left on the table.
     let display_side_px = mine.display_square_px();
 
-    let expected_pixels_per_module =
-        (peer.camera_square_px() as f32 * EXPECTED_FRAME_FILL) / actual_modules as f32;
+    let expected_pixels_per_module = (peer.camera_square_px() as f32 * EXPECTED_FRAME_FILL)
+        / (actual_modules + QUIET_MODULES * 2) as f32;
 
     Some(VisualProfile {
         modules: actual_modules,

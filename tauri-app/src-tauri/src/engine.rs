@@ -1,0 +1,534 @@
+//! The application's state: a `Modem`, a clock, and the display pacing.
+//!
+//! Everything that decides *what* to transmit lives in the `modem` crate and is
+//! tested without hardware. What lives here is the part that genuinely needs a
+//! running application — when to change the code on screen, what the camera just
+//! saw, and how the link is performing.
+
+use std::time::Instant;
+
+use modem::{Event, Modem};
+use optical_codec::decode::scan_greyscale;
+use optical_codec::device::{suggest_profile, FormFactor, VisualCapabilities};
+use optical_codec::encode::{encode, Ecc};
+use optical_codec::geometry::{advise, Advice, QrGeometry};
+use optical_protocol::session::PeerId;
+
+/// How long one code stays on screen, in milliseconds.
+///
+/// This is the single most consequential number in the application, and it is a
+/// balance rather than a maximum. Change the code too fast and the peer's camera
+/// never gets a clean exposure of any one of them; change it too slowly and the
+/// link runs below what the hardware could do.
+///
+/// 120 ms means a 30 fps camera gets roughly three chances at every code. Fewer
+/// than two and a single blurred frame loses the code entirely.
+pub const DEFAULT_HOLD_MS: u64 = 120;
+
+/// Error correction for displayed codes.
+///
+/// Q rather than L. The extra redundancy costs payload, but this medium's
+/// failures are physical — a hand moves, a reflection lands, the autofocus hunts
+/// — and those damage regions of a code rather than scattering single bits.
+/// Region damage is exactly what error correction is for.
+pub const DISPLAY_ECC: Ecc = Ecc::Q;
+
+/// Frame size to start with, derived rather than chosen.
+///
+/// A hardcoded number here would silently disagree with the measured
+/// pixels-per-module threshold the moment either changed, and the failure mode
+/// is nasty: the application starts by displaying codes its peer cannot read, so
+/// calibration never gets a single successful frame to work from and the link
+/// never starts at all.
+///
+/// So it is computed from the same profile logic the calibration layer uses,
+/// against a deliberately pessimistic assumption about the peer — a 720p webcam,
+/// which is the weaker of the two common cases. Starting low and letting
+/// calibration climb costs a little throughput for a few seconds. Starting high
+/// costs the session.
+///
+/// The profile is asked for [`DISPLAY_ECC`] specifically rather than for
+/// whichever level carries the most. Asking for the best would return a capacity
+/// computed at low correction while the engine draws at high, and the code
+/// actually displayed would be denser than the profile assumed — which is how
+/// this was wrong the first time.
+#[must_use]
+pub fn starting_mtu() -> usize {
+    let assumed = VisualCapabilities::typical(FormFactor::Laptop);
+    suggest_profile(&assumed, &assumed, DISPLAY_ECC)
+        .map_or(MINIMUM_MTU, |p| p.payload_bytes.max(MINIMUM_MTU))
+}
+
+/// Floor for the frame size.
+///
+/// Below this a frame cannot carry the transfer metadata, and a link that cannot
+/// announce a file cannot transfer one. If the profile logic ever suggests less
+/// than this, the honest answer is that the link is unusable rather than that it
+/// is very slow.
+pub const MINIMUM_MTU: usize = 64;
+
+/// What the interface needs to draw itself.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct Status {
+    pub session_state: String,
+    pub role: Option<String>,
+    pub peer_found: bool,
+    pub sending: Option<String>,
+    pub send_progress: f32,
+    pub receiving: Option<String>,
+    pub receive_progress: f32,
+    pub received_name: Option<String>,
+    pub received_len: Option<usize>,
+    /// Guidance for whoever is holding the devices.
+    pub advice: String,
+    /// Pixels per module the camera is currently resolving.
+    pub pixels_per_module: f32,
+    pub payload_per_frame: usize,
+    pub metrics: Metrics,
+    pub log: Vec<String>,
+}
+
+/// How the link is actually performing.
+///
+/// These are the numbers the Phase 0 spike existed to produce. Collecting them
+/// in the real application instead means they describe the real workload rather
+/// than a benchmark, and they keep describing it as conditions change.
+#[derive(Debug, Clone, Copy, Default, serde::Serialize)]
+pub struct Metrics {
+    /// Camera frames handed to the decoder.
+    pub frames_captured: u64,
+    /// Frames a code was found in.
+    pub frames_with_code: u64,
+    /// Frames that yielded a valid protocol packet.
+    pub frames_decoded: u64,
+    /// Mean time spent decoding one frame, in milliseconds. Backend only,
+    /// excluding transport.
+    pub decode_ms: f32,
+    /// Codes shown on screen.
+    pub frames_displayed: u64,
+    /// Fraction of displayed codes the peer appears to be reading.
+    pub decode_rate: f32,
+}
+
+/// What one camera frame produced.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct FrameOutcome {
+    pub found_code: bool,
+    pub decoded: bool,
+    pub advice: String,
+    pub pixels_per_module: f32,
+    pub sharpness: f32,
+    /// Backend decode time in milliseconds, so the caller can separate it from
+    /// capture and transport cost.
+    pub decode_ms: f32,
+    /// Corners of the detected code, for drawing an overlay.
+    pub corners: Option<[[f32; 2]; 4]>,
+}
+
+pub struct Engine {
+    modem: Modem,
+    started: Instant,
+    /// The frame currently on screen, and when it went up.
+    current: Option<(Vec<u8>, Instant)>,
+    current_svg: String,
+    hold_ms: u64,
+    metrics: Metrics,
+    decode_ms_total: f64,
+    last_geometry: Option<QrGeometry>,
+    last_advice: Advice,
+    received: Option<(String, Vec<u8>)>,
+    log: Vec<String>,
+}
+
+/// How many log lines to keep.
+///
+/// Bounded because a transfer runs for tens of thousands of frames and this is
+/// serialized to the interface on every status poll.
+const LOG_CAPACITY: usize = 40;
+
+impl Engine {
+    #[must_use]
+    pub fn new() -> Self {
+        let mut seed = [0u8; 16];
+        getrandom::fill(&mut seed).expect("the OS must provide entropy");
+
+        Self {
+            modem: Modem::new(PeerId::from_bytes(seed), starting_mtu()),
+            started: Instant::now(),
+            current: None,
+            current_svg: String::new(),
+            hold_ms: DEFAULT_HOLD_MS,
+            metrics: Metrics::default(),
+            decode_ms_total: 0.0,
+            last_geometry: None,
+            last_advice: Advice::MoveCloser,
+            received: None,
+            log: Vec::new(),
+        }
+    }
+
+    fn note(&mut self, line: impl Into<String>) {
+        self.log.push(line.into());
+        if self.log.len() > LOG_CAPACITY {
+            self.log.remove(0);
+        }
+    }
+
+    fn now(&self) -> std::time::Duration {
+        self.started.elapsed()
+    }
+
+    /// Offers a file for transfer.
+    pub fn send_file(&mut self, name: &str, bytes: Vec<u8>) {
+        self.note(format!("sending {name} ({} B)", bytes.len()));
+        self.modem.send_file(name, bytes);
+    }
+
+    /// The received file, if one arrived.
+    #[must_use]
+    pub fn take_received(&mut self) -> Option<(String, Vec<u8>)> {
+        self.received.take()
+    }
+
+    #[must_use]
+    pub fn received_ref(&self) -> Option<&(String, Vec<u8>)> {
+        self.received.as_ref()
+    }
+
+    /// Puts a taken file back.
+    ///
+    /// Needed because saving can fail after the bytes have been taken, and
+    /// losing a file that arrived — because the chosen destination was not
+    /// writable — would throw away a transfer that took minutes over a
+    /// destination the user can simply pick again.
+    pub fn restore_received(&mut self, name: String, bytes: Vec<u8>) {
+        self.received = Some((name, bytes));
+    }
+
+    /// The code to display, as an SVG document.
+    ///
+    /// Advances to the next frame only once the current one has been up for its
+    /// hold time. Calling this at the display's refresh rate is fine and
+    /// expected: the pacing lives here rather than in the interface, so that the
+    /// timing cannot drift with how often the interface happens to poll.
+    pub fn current_qr(&mut self) -> &str {
+        let now = self.now();
+        for e in self.modem.tick(now) {
+            self.absorb(e);
+        }
+
+        let expired = match &self.current {
+            None => true,
+            Some((_, since)) => since.elapsed().as_millis() as u64 >= self.hold_ms,
+        };
+        if !expired {
+            return &self.current_svg;
+        }
+
+        if let Some(frame) = self.modem.poll_frame() {
+            match encode(&frame, DISPLAY_ECC) {
+                Ok(modules) => {
+                    self.current_svg = svg_from(&modules);
+                    self.current = Some((frame, Instant::now()));
+                    self.metrics.frames_displayed += 1;
+                }
+                Err(e) => {
+                    // A frame that will not encode is a configuration fault, not
+                    // a transient one: the MTU and the correction level disagree,
+                    // and every subsequent frame will fail the same way.
+                    self.note(format!("frame will not encode: {e}"));
+                }
+            }
+        }
+
+        &self.current_svg
+    }
+
+    /// Takes in one greyscale camera frame.
+    pub fn on_camera_frame(&mut self, width: usize, height: usize, pixels: &[u8]) -> FrameOutcome {
+        let t0 = Instant::now();
+        let scan = scan_greyscale(width, height, pixels);
+        let decode_ms = t0.elapsed().as_secs_f64() * 1000.0;
+
+        self.metrics.frames_captured += 1;
+        self.decode_ms_total += decode_ms;
+        self.metrics.decode_ms =
+            (self.decode_ms_total / self.metrics.frames_captured as f64) as f32;
+
+        let geometry = scan.best_geometry();
+        self.last_geometry = geometry;
+        let advice = geometry.map_or(Advice::MoveCloser, |g| advise(&g, scan.sharpness));
+        self.last_advice = advice;
+
+        let mut decoded = false;
+        if !scan.detections.is_empty() {
+            self.metrics.frames_with_code += 1;
+        }
+        for detection in &scan.detections {
+            let events = self.modem.handle_frame(&detection.payload);
+            if !events.is_empty() {
+                decoded = true;
+            }
+            for e in events {
+                self.absorb(e);
+            }
+        }
+        // A code that decoded but produced no event is still a successful read —
+        // most data symbols produce nothing visible until the last one.
+        if !scan.detections.is_empty() {
+            self.metrics.frames_decoded += 1;
+            decoded = true;
+        }
+
+        if self.metrics.frames_captured > 0 {
+            self.metrics.decode_rate =
+                self.metrics.frames_decoded as f32 / self.metrics.frames_captured as f32;
+        }
+
+        FrameOutcome {
+            found_code: !scan.detections.is_empty() || !scan.failed.is_empty(),
+            decoded,
+            advice: advice.message().to_owned(),
+            pixels_per_module: geometry.map_or(0.0, |g| g.pixels_per_module),
+            sharpness: scan.sharpness,
+            decode_ms: decode_ms as f32,
+            corners: geometry.map(|g| g.corners.map(|p| [p.x, p.y])),
+        }
+    }
+
+    fn absorb(&mut self, event: Event) {
+        match event {
+            Event::PeerFound { peer, role } => {
+                self.note(format!("peer {peer} found, this side is the {role:?}"));
+            }
+            Event::IncomingFile { name, total_len } => {
+                self.note(format!("incoming: {name} ({total_len} B)"));
+            }
+            Event::FileReceived { name, bytes } => {
+                self.note(format!("received {name} ({} B), hash matched", bytes.len()));
+                self.received = Some((name, bytes));
+            }
+            Event::FileCorrupt { name } => {
+                // Worth its own message rather than a generic failure: every
+                // frame passed its checksum, so this points at reassembly, and
+                // saying "transfer failed" would send someone looking at the
+                // camera.
+                self.note(format!("{name} arrived but the hash did not match"));
+            }
+            Event::SendComplete => self.note("the peer has the whole file"),
+            Event::PeerLost => self.note("peer lost"),
+            Event::Closed => self.note("session closed"),
+            Event::Progress { .. } => {}
+        }
+    }
+
+    #[must_use]
+    pub fn status(&self) -> Status {
+        Status {
+            session_state: format!("{:?}", self.modem.state()),
+            role: self.modem.role().map(|r| format!("{r:?}")),
+            peer_found: self.modem.role().is_some(),
+            sending: self.modem.sending_file().map(ToOwned::to_owned),
+            send_progress: self.modem.send_progress(),
+            receiving: self.modem.receiving_file().map(ToOwned::to_owned),
+            receive_progress: self.modem.receive_progress(),
+            received_name: self.received.as_ref().map(|(n, _)| n.clone()),
+            received_len: self.received.as_ref().map(|(_, b)| b.len()),
+            advice: self.last_advice.message().to_owned(),
+            pixels_per_module: self.last_geometry.map_or(0.0, |g| g.pixels_per_module),
+            payload_per_frame: self.modem.payload_per_frame(),
+            metrics: self.metrics,
+            log: self.log.clone(),
+        }
+    }
+}
+
+impl Default for Engine {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Renders a module matrix as an SVG document.
+///
+/// Built by hand rather than through the `qrcode` crate's renderer so the
+/// matrix stays the single source of truth: the codec produces modules, and
+/// every consumer — this, the test bench, a future LED panel — draws them its
+/// own way.
+///
+/// One `<rect>` per dark module would be tens of thousands of elements; a single
+/// `<path>` with one move-and-draw per module keeps the document small enough to
+/// hand across the interface boundary sixty times a second.
+fn svg_from(modules: &optical_codec::encode::Modules) -> String {
+    const QUIET: usize = 4;
+    let size = modules.size();
+    let side = size + QUIET * 2;
+
+    let mut path = String::with_capacity(size * size * 8);
+    for y in 0..size {
+        for x in 0..size {
+            if modules.is_dark(x, y) {
+                path.push_str(&format!("M{} {}h1v1h-1z", x + QUIET, y + QUIET));
+            }
+        }
+    }
+
+    format!(
+        "<svg xmlns=\"http://www.w3.org/2000/svg\" viewBox=\"0 0 {side} {side}\" \
+         shape-rendering=\"crispEdges\">\
+         <rect width=\"{side}\" height=\"{side}\" fill=\"#fff\"/>\
+         <path d=\"{path}\" fill=\"#000\"/></svg>"
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use optical_codec::distort::{capture, Conditions};
+
+    /// Photographs a rendered code the way the real camera path does, and hands
+    /// the result back as a greyscale frame.
+    ///
+    /// The engine emits SVG for the display, so this re-encodes the same bytes
+    /// rather than rasterising the SVG: what is under test is the engine's frame
+    /// handling, not an SVG renderer.
+    fn photograph(frame_bytes: &[u8]) -> Option<(usize, usize, Vec<u8>)> {
+        let modules = encode(frame_bytes, DISPLAY_ECC).ok()?;
+        let cond = Conditions {
+            fill: 0.75,
+            ..Conditions::typical()
+        };
+        Some(capture(&modules, &cond))
+    }
+
+    /// Drains whatever the engine wants to display right now, as raw bytes.
+    fn pending_frame(engine: &mut Engine) -> Option<Vec<u8>> {
+        engine.current_qr();
+        engine.current.as_ref().map(|(bytes, _)| bytes.clone())
+    }
+
+    #[test]
+    fn a_code_is_held_long_enough_for_a_camera_to_catch_it() {
+        // The commonest way to build a link that transmits nothing is to change
+        // the code every display refresh. At 30 fps a camera needs the code to
+        // survive at least two of its frames.
+        let mut engine = Engine::new();
+        let first = pending_frame(&mut engine).expect("something to show");
+
+        // Polling again immediately must not advance it.
+        let again = pending_frame(&mut engine).expect("still showing");
+        assert_eq!(first, again, "the code must not change on every poll");
+
+        // A compile-time check: the value is a constant, so a runtime assert
+        // would be verifying something the compiler already knows, and clippy
+        // rightly objects. The intent is to pin the constant, not to test it.
+        const _: () = assert!(
+            DEFAULT_HOLD_MS >= 66,
+            "a hold shorter than two frames of a 30 fps camera would mean a \
+             single blurred frame loses the code entirely"
+        );
+    }
+
+    #[test]
+    fn the_engine_shows_something_before_a_peer_exists() {
+        // Discovery only works if both sides are already announcing. An engine
+        // that waited for a peer before displaying anything would wait forever,
+        // since the peer is waiting for the same thing.
+        let mut engine = Engine::new();
+        let svg = engine.current_qr().to_owned();
+        assert!(svg.starts_with("<svg"), "expected an SVG document");
+        assert!(svg.contains("<path"), "expected drawn modules");
+    }
+
+    #[test]
+    fn a_frame_with_no_code_is_reported_as_such() {
+        let mut engine = Engine::new();
+        let flat = vec![200u8; 640 * 480];
+        let outcome = engine.on_camera_frame(640, 480, &flat);
+
+        assert!(!outcome.found_code);
+        assert!(!outcome.decoded);
+        assert_eq!(engine.status().metrics.frames_captured, 1);
+        assert_eq!(engine.status().metrics.frames_decoded, 0);
+    }
+
+    #[test]
+    fn an_inconsistent_frame_does_not_panic() {
+        // The dimensions come across the process boundary and cannot be trusted
+        // to match the buffer.
+        let mut engine = Engine::new();
+        let outcome = engine.on_camera_frame(1000, 1000, &[0u8; 16]);
+        assert!(!outcome.found_code);
+    }
+
+    /// The application-level version of the end-to-end test: two engines find
+    /// each other by photographing one another's screens.
+    #[test]
+    fn two_engines_discover_each_other_through_a_camera() {
+        let mut a = Engine::new();
+        let mut b = Engine::new();
+
+        for _ in 0..30 {
+            if let Some(frame) = pending_frame(&mut a) {
+                if let Some((w, h, px)) = photograph(&frame) {
+                    b.on_camera_frame(w, h, &px);
+                }
+            }
+            if let Some(frame) = pending_frame(&mut b) {
+                if let Some((w, h, px)) = photograph(&frame) {
+                    a.on_camera_frame(w, h, &px);
+                }
+            }
+            // Past the hold time, so the next poll advances the code.
+            std::thread::sleep(std::time::Duration::from_millis(DEFAULT_HOLD_MS + 5));
+
+            if a.status().peer_found && b.status().peer_found {
+                break;
+            }
+        }
+
+        assert!(a.status().peer_found, "a should have found b");
+        assert!(b.status().peer_found, "b should have found a");
+        assert_ne!(
+            a.status().role,
+            b.status().role,
+            "the two sides must take different roles, or neither will drive"
+        );
+    }
+
+    #[test]
+    fn a_received_file_is_restored_when_saving_fails() {
+        // Losing a file that arrived, because the chosen destination was not
+        // writable, would throw away a transfer that took minutes.
+        let mut engine = Engine::new();
+        engine.received = Some(("x.bin".into(), vec![1, 2, 3]));
+
+        let taken = engine.take_received().expect("present");
+        assert!(engine.received_ref().is_none(), "taken means gone");
+
+        engine.restore_received(taken.0, taken.1);
+        assert_eq!(
+            engine.received_ref().map(|(n, b)| (n.as_str(), b.len())),
+            Some(("x.bin", 3))
+        );
+    }
+
+    #[test]
+    fn the_default_frame_size_fits_a_readable_code() {
+        // The engine's MTU and the measured pixels-per-module threshold have to
+        // agree, or the application starts by transmitting codes its peer cannot
+        // read and calibration has no signal to work from.
+        let probe = vec![0u8; starting_mtu()];
+        let modules = encode(&probe, DISPLAY_ECC).expect("a full frame must encode");
+
+        // At 720p with the code filling 75% of the height.
+        let px_per_module = (720.0 * 0.75) / (modules.size() + 8) as f32;
+        assert!(
+            px_per_module >= optical_codec::geometry::MIN_PIXELS_PER_MODULE,
+            "a full frame is {} modules, giving {px_per_module:.1} px/module at \
+             720p — below the measured threshold of {}",
+            modules.size(),
+            optical_codec::geometry::MIN_PIXELS_PER_MODULE
+        );
+    }
+}

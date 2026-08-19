@@ -12,10 +12,10 @@ each form factor's typical hardware:
 
 | Receiver's camera | Modules resolvable | Bytes per frame |
 |---|---|---|
-| 720p (laptop, desktop webcam) | 57 | 271 |
-| 1080p (phone, tablet) | 85 | 644 |
+| 720p (laptop, desktop webcam) | 49 | 192 |
+| 1080p (phone, tablet) | 77 | 520 |
 
-**A 2.4x difference from the receiver's camera alone.** Per-frame payload grows
+**A 2.7x difference from the receiver's camera alone.** Per-frame payload grows
 with the square of linear resolution, so a phone's rear camera on the receiving
 end is worth far more than any amount of tuning on the sending end.
 

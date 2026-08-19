@@ -21,16 +21,17 @@ The measured numbers, not aspirational ones.
 
 | Receiver's camera | Bytes per frame |
 |---|---|
-| 720p (laptop, desktop webcam) | 271 |
-| 1080p (phone, tablet) | 644 |
+| 720p (laptop, desktop webcam) | 192 |
+| 1080p (phone, tablet) | 520 |
 
-At roughly ten frames per second that is 2.7-6.4 KB/s. **A 5 MB file takes tens
+At roughly ten frames per second that is 1.9-5.2 KB/s. **A 5 MB file takes tens
 of minutes.** This is a tool for keys and configuration, not for video.
 
-Those figures come from a measured pixels-per-module threshold under realistic
-capture conditions. An earlier pass measured the same threshold under ideal
-conditions and got numbers roughly twice as good; they were real, and they
-described a capture with no blur, no noise and no tilt, which is not a capture.
+These figures have been revised downward twice, both times by removing optimism
+from the model rather than by finding a bug in the code: once when the
+pixels-per-module threshold turned out to have been measured under ideal capture
+rather than realistic capture, and once when the quiet zone turned out not to be
+counted against the camera pixels it actually consumes.
 
 Camera resolution is the dominant lever: per-frame payload grows with the
 *square* of linear resolution, whereas raising the frame rate scales linearly and
