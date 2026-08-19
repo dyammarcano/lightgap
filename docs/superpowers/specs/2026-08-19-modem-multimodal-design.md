@@ -284,3 +284,84 @@ La estrategia es que **casi todo se pueda probar sin dos laptops**:
 Los targets de Android están instalados en este toolchain y Tauri 2 soporta móvil. Un
 teléfono es un segundo peer mejor que una laptop —cámara, altavoz y micrófono superiores—
 y encaja sin cambiar el protocolo. No es alcance ahora, pero el diseño no lo impide.
+
+
+---
+
+## Anexo: hallazgos medidos durante la implementación
+
+Estos números no estaban en el diseño original. Salieron de medir, y algunos
+contradicen supuestos que el diseño daba por buenos.
+
+### Píxeles por módulo: 6, no 3
+
+Barrido sobre la cámara sintética (`cargo run -p optical-codec --example umbral`):
+
+| px/módulo | tasa de lectura |
+|---|---|
+| 2,0–3,0 | 24–40 % |
+| 3,0–6,0 | 60–87 % |
+| ≥ 6,0   | ~100 %  |
+
+El estándar da 2 como mínimo absoluto, pero supone una rejilla alineada al
+píxel. Una cámara escala de forma fraccionaria, los bordes de módulo caen a
+mitad de píxel y el detector se despista. **El doble del mínimo teórico es lo
+que cuesta la realidad.**
+
+### Capacidad real por marco a 720p
+
+Payload que decodifica **de forma fiable** (todas las repeticiones), con el
+código ocupando el 75 % del alto:
+
+| corrección | bytes fiables por marco |
+|---|---|
+| L | 500 |
+| M | 400 |
+| Q | 200 |
+| H | 200 |
+
+El diseño asumía ~900 B. La diferencia importa: a 10 QR/s son 2–5 KB/s, y **un
+archivo de 5 MB tardaría entre 17 y 40 minutos**. Conviene decírselo al usuario
+antes de empezar, no a mitad.
+
+Cuidado con la distinción entre «decodifica una vez» y «decodifica siempre»: a
+3,3 px/módulo entran 1200 B *a veces*. Negociar sobre ese número daría un perfil
+que falla uno de cada cuatro marcos.
+
+### La resolución de cámara es la palanca dominante
+
+El payload por marco crece con el **cuadrado** de la resolución lineal, mientras
+que subir FPS solo escala linealmente y bajar la corrección apenas da un factor
+2,5. Pasar de 720p a 1080p multiplica por ~2,25 el payload por marco. La
+calibración debe priorizar negociar la resolución de captura más alta que la
+cámara sostenga.
+
+### RaptorQ: acotar el bloque de fuente no es opcional
+
+Dejar que un objeto de 5 MB caiga en un solo bloque de ~6000 símbolos costaba
+**más de nueve minutos de CPU** al reconstruir. Acotando a 1024 símbolos por
+bloque baja a segundos. El coste crece muy por encima de lineal con K porque
+cada bloque se resuelve por eliminación gaussiana sobre GF(256).
+
+Esto obligó a corregir una decisión del diseño: el OTI **sí viaja** por el cable.
+Son 12 bytes una vez por transferencia, y derivarlo en ambos lados ataba el
+troceado a lo que decidiera `with_defaults`.
+
+### Fuente frente a ARQ, medido
+
+Transferencia de 5 MB sobre el simulador:
+
+| | símbolos enviados | mínimo teórico | exceso |
+|---|---|---|---|
+| Fuente, 40 % pérdida | 10 210 | 10 047 | **+1,6 %** |
+| ARQ, 15 % pérdida | 10 095 | 7 091 | +42 % |
+
+Fuente opera casi en el óptimo teórico con casi el triple de pérdida. Confirma
+que debe ser el modo por defecto para volumen, y ARQ quedar para control.
+
+### Limitación conocida de la medida de nitidez
+
+La varianza del laplaciano sube con el ruido, no solo con el enfoque: una imagen
+ruidosa y borrosa puede puntuar más que una limpia y algo borrosa. Para usarla
+como criterio de enfoque en la Fase 3 habrá que filtrar el ruido antes, o
+combinarla con otra medida.

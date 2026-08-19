@@ -2939,6 +2939,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "optical-codec"
+version = "0.1.0"
+dependencies = [
+ "optical-protocol",
+ "qrcode",
+ "rand",
+ "rand_chacha",
+ "rqrr",
+ "thiserror 2.0.20",
+]
+
+[[package]]
 name = "optical-protocol"
 version = "0.1.0"
 dependencies = [

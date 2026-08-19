@@ -5,6 +5,7 @@ members = [
     "tauri-app/src-tauri",
     "crates/optical-protocol",
     "crates/channel-sim",
+    "crates/optical-codec",
 ]
 
 [workspace.package]
