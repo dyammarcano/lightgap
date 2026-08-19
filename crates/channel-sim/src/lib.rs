@@ -1,21 +1,20 @@
-//! Enlace simulado con pérdida, retardo, jitter, duplicación y corrupción.
+//! Simulated link with loss, delay, jitter, duplication and corruption.
 //!
-//! Existe para que el núcleo del protocolo se pueda probar entero sin cámaras,
-//! sin pantallas y sin dos máquinas. Una transferencia de 5 MB con 40 % de
-//! pérdida tiene que correr en un test unitario, en milisegundos.
+//! It exists so the protocol core can be tested end to end with no cameras, no
+//! displays and no second machine. A 5 MB transfer at 40% loss has to run inside
+//! a unit test, in milliseconds.
 //!
-//! Dos propiedades hacen que eso sea posible:
+//! Two properties make that possible:
 //!
-//! - **Tiempo virtual.** El reloj lo mueve quien llama. Un retardo de 200 ms no
-//!   cuesta 200 ms de test, cuesta una suma.
-//! - **Aleatoriedad semillada.** Mismo `seed`, misma secuencia de pérdidas. Un
-//!   fallo se reproduce exactamente, que es la diferencia entre depurar y
-//!   adivinar.
+//! - **Virtual time.** The caller drives the clock. A 200 ms delay does not cost
+//!   200 ms of test time, it costs an addition.
+//! - **Seeded randomness.** Same `seed`, same sequence of losses. A failure
+//!   reproduces exactly, which is the difference between debugging and guessing.
 //!
-//! El reordenamiento no tiene mando propio: emerge del jitter, como en el medio
-//! real. Si un marco sale más tarde pero le toca menos jitter, adelanta al
-//! anterior. Un mando de "reordenar" separado modelaría algo que físicamente no
-//! ocurre por su cuenta.
+//! Reordering has no knob of its own: it emerges from jitter, as it does in the
+//! real medium. If a frame leaves later but draws less jitter, it overtakes the
+//! one before it. A separate "reorder" control would model something that does
+//! not happen on its own.
 
 use std::cell::RefCell;
 use std::collections::VecDeque;
@@ -28,24 +27,24 @@ use optical_protocol::channel::{
 use rand::{Rng, SeedableRng};
 use rand_chacha::ChaCha8Rng;
 
-/// Cómo se porta el medio.
+/// How the medium behaves.
 ///
-/// Los valores por defecto describen un enlace perfecto, para que un test que
-/// solo quiera una tubería fiable no tenga que rellenar seis campos.
+/// The defaults describe a perfect link, so a test that only wants a reliable
+/// pipe does not have to fill in six fields.
 #[derive(Debug, Clone, PartialEq)]
 pub struct LinkConfig {
-    /// Bytes útiles por marco.
+    /// Usable bytes per frame.
     pub mtu: usize,
-    /// Probabilidad de que un marco no llegue nunca, en 0..=1.
+    /// Probability a frame never arrives, in 0..=1.
     pub loss: f64,
-    /// Probabilidad de que un marco llegue dos veces.
+    /// Probability a frame arrives twice.
     pub duplicate: f64,
-    /// Probabilidad de que un marco llegue con un bit cambiado.
+    /// Probability a frame arrives with one bit changed.
     pub corrupt: f64,
-    /// Retardo base de extremo a extremo.
+    /// Base end-to-end delay.
     pub latency: Duration,
-    /// Variación añadida al retardo, uniforme en 0..=jitter. Es lo que produce
-    /// el reordenamiento.
+    /// Variation added to the delay, uniform over 0..=jitter. This is what
+    /// produces reordering.
     pub jitter: Duration,
 }
 
@@ -63,7 +62,7 @@ impl Default for LinkConfig {
 }
 
 impl LinkConfig {
-    /// Enlace perfecto con la MTU dada.
+    /// A perfect link with the given MTU.
     #[must_use]
     pub fn perfect(mtu: usize) -> Self {
         Self {
@@ -72,9 +71,9 @@ impl LinkConfig {
         }
     }
 
-    /// Enlace óptico plausible: unos 100 ms de vuelo y jitter apreciable,
-    /// porque entre mostrar un QR y decodificarlo hay varios refrescos de
-    /// pantalla y varios frames de cámara.
+    /// A plausible optical link: about 100 ms of flight time and noticeable
+    /// jitter, because between showing a QR code and decoding it there are
+    /// several display refreshes and several camera frames.
     #[must_use]
     pub fn optical(mtu: usize, loss: f64) -> Self {
         Self {
@@ -100,17 +99,17 @@ impl LinkConfig {
     }
 }
 
-/// Un marco esperando su turno de llegada.
+/// A frame waiting for its arrival time.
 #[derive(Debug, Clone)]
 struct InFlight {
     due: Duration,
     bytes: Vec<u8>,
-    /// Orden de emisión, para poder detectar reordenamiento en los tests.
+    /// Emission order, so tests can detect reordering.
     emitted: u64,
 }
 
-/// Estadísticas de lo que el medio hizo con los marcos. Sirven para comprobar
-/// que el simulador simula lo que dice simular.
+/// Statistics of what the medium did with the frames. Used to check that the
+/// simulator simulates what it claims to.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct LinkStats {
     pub offered: u64,
@@ -120,7 +119,7 @@ pub struct LinkStats {
     pub delivered: u64,
 }
 
-/// Una tubería en un solo sentido.
+/// A one-directional pipe.
 #[derive(Debug)]
 struct Wire {
     cfg: LinkConfig,
@@ -129,7 +128,7 @@ struct Wire {
     ready: VecDeque<Vec<u8>>,
     stats: LinkStats,
     emitted: u64,
-    /// Orden de emisión del último marco entregado, para contar adelantamientos.
+    /// Emission order of the last delivered frame, to count overtakes.
     last_delivered_order: Option<u64>,
     reorders: u64,
 }
@@ -189,11 +188,10 @@ impl Wire {
         }
     }
 
-    /// Mueve a la cola de listos todo lo que ya debería haber llegado.
+    /// Moves everything that should have arrived by now onto the ready queue.
     fn advance(&mut self, now: Duration) {
-        // Estable por `due` para que dos marcos con el mismo vencimiento
-        // conserven el orden de emisión; el reordenamiento debe venir del
-        // jitter, no de un detalle del contenedor.
+        // Stable by `due` so two frames sharing a deadline keep their emission
+        // order; reordering must come from jitter, not from a container detail.
         self.inflight
             .sort_by(|a, b| a.due.cmp(&b.due).then(a.emitted.cmp(&b.emitted)));
 
@@ -211,7 +209,7 @@ impl Wire {
     }
 }
 
-/// Un extremo del enlace: escribe en una tubería y lee de la otra.
+/// One end of the link: writes into one pipe and reads from the other.
 pub struct SimEndpoint {
     tx: Rc<RefCell<Wire>>,
     rx: Rc<RefCell<Wire>>,
@@ -221,32 +219,32 @@ pub struct SimEndpoint {
 }
 
 impl SimEndpoint {
-    /// Estadísticas de lo que este extremo ha emitido.
+    /// Statistics of what this end has emitted.
     #[must_use]
     pub fn tx_stats(&self) -> LinkStats {
         self.tx.borrow().stats
     }
 
-    /// Estadísticas de lo que este extremo ha recibido.
+    /// Statistics of what this end has received.
     #[must_use]
     pub fn rx_stats(&self) -> LinkStats {
         self.rx.borrow().stats
     }
 
-    /// Cuántas veces un marco llegó por delante de otro emitido antes.
+    /// How many times a frame arrived ahead of one emitted before it.
     #[must_use]
     pub fn rx_reorders(&self) -> u64 {
         self.rx.borrow().reorders
     }
 
-    /// Marca un marco recibido como inválido. Lo lleva la capa de arriba,
-    /// porque es la única que sabe interpretar los bytes.
+    /// Marks a received frame as invalid. Driven by the layer above, since it is
+    /// the only one that knows how to interpret the bytes.
     pub fn note_rejected(&mut self) {
         self.health.frames_rejected += 1;
     }
 
-    /// Si queda algo por entregar. Un test que espera a que el enlace se vacíe
-    /// necesita saberlo sin hurgar en el interior.
+    /// Whether anything is still pending delivery. A test waiting for the link
+    /// to drain needs to know without poking at internals.
     #[must_use]
     pub fn rx_idle(&self) -> bool {
         let w = self.rx.borrow();
@@ -287,38 +285,38 @@ impl Channel for SimEndpoint {
     fn advance(&mut self, now: Duration) {
         self.now = now;
         self.rx.borrow_mut().advance(now);
-        // La tubería de salida también avanza: al otro lado hay un extremo que
-        // la lee, y su reloj puede ir por detrás del nuestro.
+        // The outbound pipe advances too: there is an endpoint on the other side
+        // reading it, and its clock may be running behind ours.
         self.tx.borrow_mut().advance(now);
     }
 }
 
-/// Dos extremos conectados por dos tuberías independientes.
+/// Two endpoints joined by two independent pipes.
 ///
-/// Independientes a propósito: el diseño contempla enlaces asimétricos, donde
-/// una dirección funciona y la otra no. Un solo medio compartido no podría
-/// expresar eso.
+/// Independent on purpose: the design allows for asymmetric links where one
+/// direction works and the other does not. A single shared medium could not
+/// express that.
 pub struct SimPair {
     pub a: SimEndpoint,
     pub b: SimEndpoint,
 }
 
 impl SimPair {
-    /// Construye un par con la misma configuración en ambos sentidos.
+    /// Builds a pair with the same configuration in both directions.
     #[must_use]
     pub fn new(cfg: LinkConfig, seed: u64) -> Self {
         Self::asymmetric(cfg.clone(), cfg, seed)
     }
 
-    /// Construye un par con configuración distinta por sentido.
+    /// Builds a pair with a different configuration per direction.
     #[must_use]
     pub fn asymmetric(a_to_b: LinkConfig, b_to_a: LinkConfig, seed: u64) -> Self {
         let mtu_ab = a_to_b.mtu;
         let mtu_ba = b_to_a.mtu;
 
-        // Semillas distintas por sentido: con la misma, las dos direcciones
-        // perderían los marcos en los mismos instantes y el test estaría
-        // midiendo una coincidencia, no el protocolo.
+        // Different seeds per direction: with the same one, both directions
+        // would drop frames at the same instants and the test would be measuring
+        // a coincidence rather than the protocol.
         let ab = Rc::new(RefCell::new(Wire::new(a_to_b, seed)));
         let ba = Rc::new(RefCell::new(Wire::new(
             b_to_a,
@@ -351,7 +349,7 @@ impl SimPair {
         }
     }
 
-    /// Mueve el reloj de los dos extremos a la vez.
+    /// Moves both endpoints' clocks at once.
     pub fn advance(&mut self, now: Duration) {
         self.a.advance(now);
         self.b.advance(now);

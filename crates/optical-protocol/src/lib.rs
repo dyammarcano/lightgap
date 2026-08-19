@@ -1,14 +1,14 @@
-//! Núcleo sans-io del módem multimodal air-gapped.
+//! Sans-io core of the air-gapped multimodal modem.
 //!
-//! Este crate no abre cámaras, ni sockets, ni audio. Es una máquina de estados
-//! pura: se le entregan PDUs entrantes, se le pregunta qué transmitir, y se le
-//! avisa del paso del tiempo. Ese es el patrón de `quinn` y `rustls`, y es lo
-//! que permite probar una transferencia completa con 40 % de pérdida sin
-//! encender una sola cámara.
+//! This crate opens no cameras, no sockets and no audio devices. It is a pure
+//! state machine: you hand it incoming PDUs, ask what to transmit, and tell it
+//! that time has passed. That is the `quinn` and `rustls` pattern, and it is
+//! what lets a full transfer at 40% loss be tested without turning on a single
+//! camera.
 //!
-//! La consecuencia de diseño importante: el protocolo no sabe por qué medio
-//! viaja. Añadir el canal acústico, LEDs o un socket TCP es implementar un
-//! trait, no editar esta capa.
+//! The design consequence that matters: the protocol does not know which medium
+//! it travels over. Adding the acoustic channel, LEDs, or a TCP socket means
+//! implementing a trait, not editing this layer.
 
 pub mod channel;
 pub mod reliability;

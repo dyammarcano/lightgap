@@ -1,18 +1,20 @@
-//! Código de fuente (RaptorQ): el emisor no espera a nadie.
+//! Fountain coding (RaptorQ): the sender waits for nobody.
 //!
-//! El emisor genera símbolos codificados indefinidamente. El receptor
-//! reconstruye en cuanto reúne suficientes, y da igual *cuáles*: cualquier
-//! subconjunto de tamaño suficiente sirve. Eso elimina el round-trip óptico,
-//! que en este medio es el coste dominante — mostrar un QR, capturarlo,
-//! decodificarlo y contestar con otro QR cuesta cientos de milisegundos.
+//! The sender generates coded symbols without end. The receiver reconstructs as
+//! soon as it has gathered enough, and it does not matter *which* ones: any
+//! sufficiently large subset works. That removes the optical round trip, which
+//! is the dominant cost in this medium — showing a QR code, capturing it,
+//! decoding it and answering with another QR code costs hundreds of
+//! milliseconds.
 //!
-//! La consecuencia práctica: no hay retransmisiones que pedir, ni huecos que
-//! rastrear, ni ventana que gestionar. El único mensaje de vuelta que importa
-//! es «ya está, para».
+//! The practical consequence: there are no retransmissions to request, no gaps
+//! to track, no window to manage. The only return message that matters is
+//! "done, stop".
 //!
-//! El emisor sí necesita esa confirmación: sin ella emitiría para siempre. Es
-//! el único punto donde la fuente depende del canal de retorno, y por eso el
-//! diseño replica ese mensaje por ambos canales cuando hay dos.
+//! The sender does need that confirmation: without it, it would emit forever. It
+//! is the single point where fountain coding depends on the return path, and it
+//! is why the design replicates that message across both channels when two are
+//! available.
 
 use std::collections::VecDeque;
 
@@ -20,84 +22,84 @@ use raptorq::{Decoder, Encoder, EncodingPacket, ObjectTransmissionInformation};
 
 use super::{Feedback, Progress, Receiver, RecvError, Sender, Symbol};
 
-/// Bytes que RaptorQ antepone a cada símbolo (el `PayloadId`).
+/// Bytes RaptorQ prepends to every symbol (the `PayloadId`).
 ///
-/// Importa para dimensionar: si el canal admite un payload de P bytes, el
-/// tamaño de símbolo utilizable es P − 4.
+/// It matters for sizing: if the channel allows a payload of P bytes, the usable
+/// symbol size is P − 4.
 pub const PACKET_ID_LEN: usize = 4;
 
-/// Cuántos símbolos de reparación se generan por tanda y por bloque.
+/// How many repair symbols are generated per batch and per block.
 ///
-/// Generarlos de uno en uno desperdiciaría la preparación del codificador;
-/// generarlos de mil en mil ocuparía memoria que quizá no haga falta si el
-/// receptor confirma pronto.
+/// Generating them one at a time would waste the encoder's setup; generating
+/// them a thousand at a time would hold memory that may never be needed if the
+/// receiver confirms early.
 const REPAIR_BATCH: u32 = 64;
 
-/// Tamaño de símbolo utilizable dentro de un payload de `max_payload` bytes.
+/// Usable symbol size within a payload of `max_payload` bytes.
 ///
-/// No recorta a ningún alineamiento: [`plan`] construye el OTI eligiendo el
-/// alineamiento que encaje con el tamaño, así que cualquier valor sirve y no se
-/// pierde ni un byte por marco. (`ObjectTransmissionInformation::with_defaults`
-/// sí recortaba a múltiplos de 8 — de ahí venía un bug en el que el receptor
-/// validaba contra el tamaño pedido y rechazaba **todos** los símbolos.)
+/// Nothing is trimmed to any alignment: [`plan`] builds the OTI choosing an
+/// alignment that fits the size, so any value works and not a byte is wasted per
+/// frame. (`ObjectTransmissionInformation::with_defaults` *did* round down to
+/// multiples of 8 — that was the source of a bug where the receiver validated
+/// against the requested size and rejected **every** symbol.)
 ///
-/// Devuelve `None` si no queda sitio ni para un byte de datos.
+/// Returns `None` if there is no room left for even one byte of data.
 #[must_use]
 pub fn symbol_size_for(max_payload: usize) -> Option<u16> {
     let usable = u16::try_from(max_payload.checked_sub(PACKET_ID_LEN)?).ok()?;
     (usable > 0).then_some(usable)
 }
 
-/// Cuántos símbolos de fuente puede tener como mucho un bloque.
+/// The most source symbols a single block may contain.
 ///
-/// Este número decide el coste de decodificar, y no es un detalle menor:
-/// RaptorQ resuelve cada bloque por eliminación gaussiana sobre GF(256), que
-/// crece muy por encima de lineal con K. Medido en este proyecto, dejar que un
-/// objeto de 5 MB cayera en un solo bloque de ~6000 símbolos costaba más de
-/// nueve minutos de CPU al reconstruir. Troceado en bloques de ~1000 baja a
-/// segundos, a cambio de un poco menos de eficiencia de codificación.
+/// This number decides decoding cost, and it is not a minor detail: RaptorQ
+/// solves each block by Gaussian elimination over GF(256), which grows far
+/// worse than linearly in K. Measured in this project, letting a 5 MB object
+/// fall into a single block of ~6000 symbols cost over nine minutes of CPU to
+/// reconstruct. Split into blocks of ~1000 it drops to seconds, at the price of
+/// slightly worse coding efficiency.
 ///
-/// Es un compromiso de experiencia de uso: nadie espera nueve minutos mirando
-/// una barra parada después de haber sostenido dos portátiles enfrentados.
+/// It is a user-experience trade-off: nobody waits nine minutes staring at a
+/// stalled bar after holding two laptops face to face.
 pub const MAX_SYMBOLS_PER_BLOCK: u32 = 1024;
 
-/// Parámetros de transmisión de un objeto.
+/// Transmission parameters for an object.
 ///
-/// **Viajan por el cable**, en los metadatos de la transferencia: son 12 bytes
-/// una sola vez. Una versión anterior los derivaba en ambos lados para
-/// ahorrárselos, pero era mal negocio — ataba el número de bloques a lo que
-/// decidiera `with_defaults`, que es justo el parámetro que hay que poder
-/// ajustar. Doce bytes por transferencia no se comparan con minutos de espera.
+/// These **travel the wire**, in the transfer metadata: twelve bytes, once. An
+/// earlier version derived them on both sides to save those bytes, but it was a
+/// bad trade — it pinned the block count to whatever `with_defaults` decided,
+/// which is precisely the parameter that has to be tunable. Twelve bytes per
+/// transfer do not compare to minutes of waiting.
 ///
 /// # Panics
-/// Con `total_len` de cero: RaptorQ divide por el número de símbolos y revienta
-/// dentro de la librería con un mensaje que no dice de dónde viene. Las rutas
-/// normales del emisor y del receptor ni llegan a llamarlo — un objeto vacío se
-/// resuelve sin tocar RaptorQ.
+/// With a `total_len` of zero: RaptorQ divides by the symbol count and blows up
+/// inside the library with a message that says nothing about where it came from.
+/// The normal sender and receiver paths never call it — an empty object is
+/// handled without touching RaptorQ at all.
 #[must_use]
 pub fn plan(total_len: u64, symbol_size: u16) -> ObjectTransmissionInformation {
     assert!(
         total_len > 0,
-        "RaptorQ no admite objetos vacíos; trátalos antes de llegar aquí"
+        "RaptorQ does not accept empty objects; handle them before getting here"
     );
-    assert!(symbol_size > 0, "el tamaño de símbolo no puede ser cero");
+    assert!(symbol_size > 0, "symbol size cannot be zero");
 
-    // El alineamiento tiene que dividir al tamaño de símbolo: es una
-    // precondición que `ObjectTransmissionInformation::new` comprueba con un
-    // assert propio, y con 1 siempre se cumple.
+    // The alignment has to divide the symbol size: it is a precondition that
+    // `ObjectTransmissionInformation::new` asserts on its own, and 1 always
+    // satisfies it.
     let alignment: u8 = if symbol_size.is_multiple_of(8) { 8 } else { 1 };
 
     let total_symbols = total_len.div_ceil(u64::from(symbol_size));
     let blocks = total_symbols.div_ceil(u64::from(MAX_SYMBOLS_PER_BLOCK));
-    // `source_blocks` es un u8; por encima de 255 bloques se aceptan bloques
-    // más grandes antes que producir un OTI inválido.
+    // `source_blocks` is a u8; beyond 255 blocks we accept larger blocks rather
+    // than produce an invalid OTI.
     let blocks = blocks.clamp(1, 255) as u8;
 
     ObjectTransmissionInformation::new(total_len, symbol_size, blocks, 1, alignment)
 }
 
-/// Cuántos símbolos de fuente tiene un objeto. Es el mínimo teórico de símbolos
-/// que hay que reunir; en la práctica hacen falta unos pocos más.
+/// How many source symbols an object has. The theoretical minimum to gather; in
+/// practice a few more are needed.
 fn source_symbols(total_len: u64, symbol_size: u16) -> u32 {
     if symbol_size == 0 {
         return 0;
@@ -105,19 +107,19 @@ fn source_symbols(total_len: u64, symbol_size: u16) -> u32 {
     total_len.div_ceil(u64::from(symbol_size)) as u32
 }
 
-/// El lado que tiene el objeto y emite símbolos sin descanso.
+/// The side that holds the object and emits symbols without pause.
 pub struct FountainSender {
-    /// `None` para un objeto vacío.
+    /// `None` for an empty object.
     ///
-    /// No es una optimización: `raptorq` divide por el número de símbolos al
-    /// construirse, y con longitud cero entra en pánico dentro de la librería
-    /// (util.rs:45). Un archivo vacío es algo legítimo de transferir, así que el
-    /// codificador simplemente no llega a existir.
+    /// Not an optimization: `raptorq` divides by the symbol count when
+    /// constructed, and with zero length it panics inside the library. An empty
+    /// file is a legitimate thing to transfer, so the encoder simply never comes
+    /// into existence.
     encoder: Option<Encoder>,
     symbol_size: u16,
     source_symbols: u32,
     pending: VecDeque<Vec<u8>>,
-    /// Identificador del próximo símbolo de reparación a generar.
+    /// Identifier of the next repair symbol to generate.
     next_repair_id: u32,
     source_emitted: bool,
     emitted: u32,
@@ -140,15 +142,16 @@ impl FountainSender {
             complete: false,
         };
 
-        // Un objeto vacío no llega a tocar RaptorQ: `with_defaults` divide por
-        // el número de símbolos y entra en pánico con longitud cero.
+        // An empty object never reaches RaptorQ: `plan` divides by the symbol
+        // count and panics at zero length.
         if object.is_empty() {
             return base;
         }
 
         let config = plan(object.len() as u64, symbol_size);
-        // El tamaño efectivo lo fija el OTI, no el que se pidió: RaptorQ lo
-        // alinea a la baja y usar el pedido descuadraría todos los cálculos.
+        // The effective size is set by the OTI, not by what was requested: the
+        // OTI may adjust it, and using the requested value would throw off every
+        // derived calculation.
         let effective = config.symbol_size();
         Self {
             encoder: Some(Encoder::new(object, config)),
@@ -158,9 +161,9 @@ impl FountainSender {
         }
     }
 
-    /// Cuántos símbolos se han emitido en total. Con fuente puede superar
-    /// ampliamente el número de símbolos de fuente, y eso es el mecanismo
-    /// funcionando, no un síntoma.
+    /// How many symbols have been emitted in total. Under fountain coding this
+    /// can far exceed the source symbol count, and that is the mechanism working
+    /// rather than a symptom.
     #[must_use]
     pub fn emitted(&self) -> u32 {
         self.emitted
@@ -171,31 +174,31 @@ impl FountainSender {
         self.source_symbols
     }
 
-    /// Tamaño de símbolo **efectivo**, ya alineado por RaptorQ. Puede ser menor
-    /// que el que se pidió al construir.
+    /// The **effective** symbol size, as fixed by the OTI. May differ from what
+    /// was requested at construction.
     #[must_use]
     pub fn symbol_size(&self) -> u16 {
         self.symbol_size
     }
 
-    /// Bytes que ocupa cada símbolo serializado, identificador incluido. Es lo
-    /// que tiene que caber en el payload de un PDU.
+    /// Bytes each serialized symbol occupies, identifier included. This is what
+    /// has to fit in a PDU payload.
     #[must_use]
     pub fn wire_len(&self) -> usize {
         usize::from(self.symbol_size) + PACKET_ID_LEN
     }
 
-    /// Parámetros de transmisión para mandar en los metadatos.
+    /// Transmission parameters to send in the metadata.
     ///
-    /// `None` para un objeto vacío: no hay plan que mandar, y el receptor lo
-    /// resuelve sabiendo únicamente que la longitud es cero.
+    /// `None` for an empty object: there is no plan to send, and the receiver
+    /// resolves it knowing only that the length is zero.
     #[must_use]
     pub fn oti_bytes(&self) -> Option<[u8; 12]> {
         self.encoder.as_ref().map(|e| e.get_config().serialize())
     }
 
-    /// Rellena la cola. Primero los símbolos de fuente —son los que decodifican
-    /// más barato— y a partir de ahí, reparación sin fin.
+    /// Refills the queue. Source symbols first — they are the cheapest to decode
+    /// — and repair symbols without end from there on.
     fn refill(&mut self) {
         let Some(encoder) = self.encoder.as_ref() else {
             return;
@@ -226,8 +229,8 @@ impl Sender for FountainSender {
         if self.complete {
             return None;
         }
-        // Un objeto vacío no tiene nada que emitir; sin esta salida el relleno
-        // giraría para siempre produciendo tandas vacías.
+        // An empty object has nothing to emit; without this exit the refill
+        // would spin forever producing empty batches.
         if self.source_symbols == 0 {
             return None;
         }
@@ -248,8 +251,8 @@ impl Sender for FountainSender {
     }
 
     fn on_feedback(&mut self, feedback: &Feedback) {
-        // Una realimentación de ARQ sobre una transferencia de fuente indica un
-        // fallo de negociación. Se ignora en vez de tumbar la sesión.
+        // ARQ feedback on a fountain transfer indicates a negotiation failure.
+        // Ignored rather than allowed to tear down the session.
         let Feedback::Fountain { complete, received } = feedback else {
             return;
         };
@@ -264,8 +267,9 @@ impl Sender for FountainSender {
     }
 
     fn progress(&self) -> Progress {
-        // El progreso del emisor es lo que el receptor dice tener, no lo que él
-        // ha soltado: con fuente, emitir más no significa avanzar.
+        // The sender's progress is what the receiver says it holds, not what the
+        // sender has emitted: under fountain coding, emitting more is not
+        // advancing.
         Progress {
             have: u64::from(self.peer_received.min(self.source_symbols)),
             need: u64::from(self.source_symbols),
@@ -273,20 +277,19 @@ impl Sender for FountainSender {
     }
 }
 
-/// El lado que reúne símbolos hasta poder reconstruir.
+/// The side that gathers symbols until it can reconstruct.
 pub struct FountainReceiver {
-    /// `None` para un objeto vacío, por la misma razón que en el emisor:
-    /// construir el decodificador con longitud cero hace que `raptorq` divida
-    /// por cero.
+    /// `None` for an empty object, for the same reason as in the sender:
+    /// constructing the decoder at zero length makes `raptorq` divide by zero.
     decoder: Option<Decoder>,
     symbol_size: u16,
     source_symbols: u32,
     received: u32,
     object: Option<Vec<u8>>,
-    /// Separado de `object` a propósito: `take_object` vacía el objeto, y si
-    /// `is_complete` dependiera de él, el receptor pasaría a declararse
-    /// incompleto justo después de entregar el resultado — y su realimentación
-    /// le diría al emisor que siguiera emitiendo.
+    /// Kept separate from `object` on purpose: `take_object` empties the object,
+    /// and if `is_complete` depended on it the receiver would declare itself
+    /// incomplete right after handing over the result — and its feedback would
+    /// tell the sender to keep emitting.
     complete: bool,
     taken: bool,
 }
@@ -294,9 +297,9 @@ pub struct FountainReceiver {
 impl FountainReceiver {
     #[must_use]
     pub fn new(total_len: u64, symbol_size: u16) -> Self {
-        // Un objeto vacío ya está reconstruido, y además no se puede construir
-        // el decodificador para él: `with_defaults` entra en pánico con
-        // longitud cero. Resolverlo aquí evita las dos cosas.
+        // An empty object is already reconstructed, and the decoder cannot be
+        // built for it anyway: `plan` panics at zero length. Handling it here
+        // avoids both problems.
         if total_len == 0 {
             return Self {
                 decoder: None,
@@ -308,14 +311,13 @@ impl FountainReceiver {
                 taken: false,
             };
         }
-
         Self::from_config(plan(total_len, symbol_size))
     }
 
-    /// Construye a partir de los parámetros que mandó el emisor.
+    /// Builds from the parameters the sender transmitted.
     ///
-    /// Es la vía preferente: usar exactamente el plan del emisor elimina la
-    /// posibilidad de que los dos lados troceen el objeto de forma distinta.
+    /// This is the preferred path: using the sender's exact plan removes any
+    /// possibility of the two sides splitting the object differently.
     #[must_use]
     pub fn from_oti_bytes(oti: &[u8; 12]) -> Self {
         Self::from_config(ObjectTransmissionInformation::deserialize(oti))
@@ -323,9 +325,10 @@ impl FountainReceiver {
 
     fn from_config(config: ObjectTransmissionInformation) -> Self {
         let total_len = config.transfer_length();
-        // El tamaño efectivo lo fija el OTI, no el que se pidió. Contar los
-        // símbolos de fuente con el pedido daría una cuenta distinta a la del
-        // emisor, y el progreso mentiría en el sentido peligroso: por lo bajo.
+        // The effective size is set by the OTI, not by what was requested.
+        // Counting source symbols with the requested value would give a
+        // different count than the sender's, and progress would lie in the
+        // dangerous direction: low.
         let effective = config.symbol_size();
         Self {
             decoder: Some(Decoder::new(config)),
@@ -343,26 +346,26 @@ impl FountainReceiver {
         self.complete
     }
 
-    /// Cuántos símbolos se han incorporado, útiles o no.
+    /// How many symbols have been taken in, useful or not.
     #[must_use]
     pub fn received(&self) -> u32 {
         self.received
     }
 
-    /// Tamaño de símbolo **efectivo**, el que fija el OTI.
+    /// The **effective** symbol size, as fixed by the OTI.
     #[must_use]
     pub fn symbol_size(&self) -> u16 {
         self.symbol_size
     }
 
-    /// Cuántos símbolos de fuente tiene el objeto según el plan. Es el mínimo
-    /// teórico a reunir; en la práctica hacen falta unos pocos más.
+    /// How many source symbols the object has according to the plan. The
+    /// theoretical minimum to gather; in practice a few more are needed.
     #[must_use]
     pub fn source_symbols_expected(&self) -> u32 {
         self.source_symbols
     }
 
-    /// Bytes que debe traer cada símbolo serializado, identificador incluido.
+    /// Bytes each serialized symbol must carry, identifier included.
     #[must_use]
     pub fn wire_len(&self) -> usize {
         usize::from(self.symbol_size) + PACKET_ID_LEN
@@ -371,10 +374,10 @@ impl FountainReceiver {
 
 impl Receiver for FountainReceiver {
     fn on_symbol(&mut self, symbol: &Symbol) -> Result<(), RecvError> {
-        // `EncodingPacket::deserialize` indexa los cuatro primeros bytes sin
-        // comprobarlos: con un buffer más corto entra en pánico. Un símbolo
-        // truncado es algo que este medio produce de verdad, así que se filtra
-        // aquí antes de dejarle ver nada.
+        // `EncodingPacket::deserialize` indexes the first four bytes without
+        // checking them: a shorter buffer panics. A truncated symbol is
+        // something this medium genuinely produces, so it is filtered here
+        // before the library ever sees it.
         let expected = usize::from(self.symbol_size) + PACKET_ID_LEN;
         if symbol.bytes.len() != expected {
             return Err(RecvError::SymbolSize {
@@ -386,8 +389,8 @@ impl Receiver for FountainReceiver {
         self.received = self.received.saturating_add(1);
 
         if self.complete {
-            // Ya está reconstruido; seguir alimentando al decodificador no
-            // aporta nada y cuesta.
+            // Already reconstructed; feeding the decoder further adds nothing
+            // and costs time.
             return Ok(());
         }
 

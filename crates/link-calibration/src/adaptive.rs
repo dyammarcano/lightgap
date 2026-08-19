@@ -1,42 +1,43 @@
-//! Ajuste continuo durante la transferencia.
+//! Continuous adjustment during the transfer.
 //!
-//! El perfil negociado al principio caduca: alguien mueve un portátil, cambia
-//! la luz de la habitación, el autofoco vuelve a cazar. Sin ajuste continuo, la
-//! calibración inicial solo describe el primer minuto.
+//! The profile negotiated at the start expires: someone shifts a laptop, the
+//! room light changes, autofocus hunts again. Without continuous adjustment, the
+//! initial calibration only describes the first minute.
 //!
-//! La progresión es **aditiva al subir y multiplicativa al bajar**, como el
-//! control de congestión de TCP y por la misma razón: pasarse al subir cuesta
-//! poco si se sube despacio, mientras que bajar despacio cuando el enlace ya se
-//! rompió alarga el corte. Ante la duda, retroceder rápido.
+//! Progression is **additive on the way up and multiplicative on the way down**,
+//! like TCP congestion control and for the same reason: overshooting costs
+//! little if you climb slowly, whereas backing off slowly once the link has
+//! already broken prolongs the outage. When in doubt, retreat fast.
 
-/// Qué hacer con el perfil.
+/// What to do with the profile.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Adaptation {
-    /// Subir el parámetro: el enlace va sobrado.
+    /// Raise the parameter: the link has room to spare.
     Increase,
-    /// Dejarlo como está.
+    /// Leave it alone.
     Hold,
-    /// Bajarlo: el enlace está sufriendo.
+    /// Lower it: the link is struggling.
     Reduce,
-    /// Bajarlo mucho y avisar: el enlace está roto.
+    /// Lower it sharply and raise the alarm: the link is broken.
     Recover,
 }
 
-/// Tasa de acierto a partir de la cual el enlace va sobrado.
+/// Success rate above which the link has room to spare.
 pub const EXCELLENT: f32 = 0.99;
-/// Por encima de esto no hace falta tocar nada.
+/// Above this, nothing needs touching.
 pub const ACCEPTABLE: f32 = 0.95;
-/// Por debajo de esto el enlace no está degradado, está roto.
+/// Below this the link is not degraded, it is broken.
 pub const STRUGGLING: f32 = 0.85;
 
-/// Cuántas observaciones buenas seguidas hacen falta para atreverse a subir.
+/// How many consecutive good observations are needed before daring to climb.
 ///
-/// Varias, no una: un pico de suerte no es una mejora del enlace, y subir a la
-/// primera produce una oscilación entre dos perfiles que cuesta más que
-/// quedarse en el bajo.
+/// Several, not one: a lucky spike is not an improvement in the link, and
+/// climbing on the first one produces an oscillation between two profiles that
+/// costs more than staying at the lower one.
 pub const GOOD_STREAK_TO_INCREASE: u32 = 3;
 
-/// Controlador aditivo-multiplicativo sobre un parámetro entero.
+/// Additive-increase, multiplicative-decrease controller over an integer
+/// parameter.
 #[derive(Debug, Clone)]
 pub struct Aimd {
     current: u32,
@@ -49,10 +50,10 @@ pub struct Aimd {
 
 impl Aimd {
     /// # Panics
-    /// Si el rango es vacío.
+    /// If the range is empty.
     #[must_use]
     pub fn new(current: u32, min: u32, max: u32, increment: u32) -> Self {
-        assert!(min > 0 && min <= max, "rango inválido: {min}..={max}");
+        assert!(min > 0 && min <= max, "invalid range: {min}..={max}");
         Self {
             current: current.clamp(min, max),
             min,
@@ -73,7 +74,7 @@ impl Aimd {
         self.good_streak
     }
 
-    /// Incorpora una observación de tasa de acierto y ajusta el parámetro.
+    /// Takes in a success-rate observation and adjusts the parameter.
     pub fn observe(&mut self, success_rate: f32) -> Adaptation {
         let rate = success_rate.clamp(0.0, 1.0);
 
@@ -96,26 +97,26 @@ impl Aimd {
         let factor = if rate >= STRUGGLING {
             self.decrease_factor
         } else {
-            // Por debajo del umbral de agonía se retrocede el doble: el enlace
-            // no está degradado, está roto, y bajar un escalón solo alarga el
-            // corte.
+            // Below the distress threshold, back off twice as hard: the link is
+            // not degraded, it is broken, and stepping down one notch only
+            // prolongs the outage.
             self.decrease_factor * self.decrease_factor
         };
 
-        // Redondeo, no truncamiento: 1000 × 0,7 da 699,999… en coma flotante,
-        // y truncar convierte un factor limpio en un off-by-one que luego
-        // aparece como constante mágica en los tests.
-        let nuevo = ((f64::from(self.current) * f64::from(factor)).round() as u32).max(self.min);
-        let cambio = nuevo != self.current;
-        self.current = nuevo;
+        // Rounding, not truncation: 1000 x 0.7 comes out as 699.999... in
+        // floating point, and truncating turns a clean factor into an off-by-one
+        // that later shows up as a magic constant in the tests.
+        let next = ((f64::from(self.current) * f64::from(factor)).round() as u32).max(self.min);
+        let changed = next != self.current;
+        self.current = next;
 
         if rate < STRUGGLING {
             Adaptation::Recover
-        } else if cambio {
+        } else if changed {
             Adaptation::Reduce
         } else {
-            // Ya en el mínimo: no hay nada que recortar, y decir «Reduce» cuando
-            // no se puede reducir engañaría a quien llama.
+            // Already at the minimum: there is nothing left to cut, and saying
+            // "Reduce" when nothing can be reduced would mislead the caller.
             Adaptation::Hold
         }
     }

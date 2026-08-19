@@ -111,7 +111,7 @@ button {
   }
 }
 
-/* FASE 0 — estilos del spike. Se borran con el spike. */
+/* PHASE 0 - spike styles. Deleted along with the spike. */
 .spike { max-width: 1400px; margin: 0 auto; padding: 1rem; text-align: left; }
 .spike .hint { opacity: 0.7; font-size: 0.9rem; }
 .spike .panes { display: grid; grid-template-columns: 1fr 1fr; gap: 1rem; align-items: start; }

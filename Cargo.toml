@@ -14,7 +14,7 @@ edition = "2021"
 license = "MIT"
 
 [workspace.dependencies]
-# Compartidas entre crates. Las específicas de una fase viven en su crate.
+# Shared across crates. Phase-specific ones live in their own crate.
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 thiserror = "2"
@@ -26,7 +26,7 @@ opt-level = 3
 panic = "abort"
 strip = true
 
-# El decode de QR y el DSP de audio corren en debug durante el desarrollo.
-# Sin esto son demasiado lentos para evaluar el enlace de forma realista.
+# QR decoding and audio DSP run in debug during development. Without this they
+# are too slow to evaluate the link realistically.
 [profile.dev.package."*"]
 opt-level = 2

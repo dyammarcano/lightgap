@@ -23,6 +23,7 @@ tauri-plugin-opener = "2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 
-# FASE 0 (spike, desechable): se van con el spike si la ruta hibrida no cuaja.
+# PHASE 0 (throwaway spike): these go away with the spike if the hybrid path
+# does not pan out.
 rqrr = "0.9"
 qrcode = { version = "0.14", default-features = false, features = ["svg"] }

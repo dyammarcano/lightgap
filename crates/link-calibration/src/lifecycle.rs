@@ -1,50 +1,50 @@
-//! Ciclo de vida de un canal, independiente de la sesión.
+//! A channel's lifecycle, independent of the session.
 //!
-//! Esta separación es lo que permite que añadir el canal acústico no obligue a
-//! tocar la máquina de estados de la sesión. Cada medio nace caído, se sondea,
-//! se pone en marcha con un perfil, se degrada y puede volver a caer, sin que
-//! la sesión sepa nada de ello.
+//! This separation is what lets the acoustic channel be added without touching
+//! the session state machine. Each medium is born down, gets probed, comes up
+//! with a profile, degrades, and may go down again, without the session knowing
+//! anything about it.
 
 use core::time::Duration;
 
-/// Estado de un canal.
+/// A channel's state.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LinkState {
-    /// No hay enlace por este medio.
+    /// No link over this medium.
     Down,
-    /// Buscando perfil.
+    /// Searching for a profile.
     Probing,
-    /// Operativo.
+    /// Operational.
     Up,
-    /// Operativo pero sufriendo; se sigue usando mientras entregue algo.
+    /// Operational but struggling; still used while it delivers anything.
     Degraded,
 }
 
-/// Tiempo sin marcos válidos tras el cual el canal se da por caído.
+/// Time without valid frames after which the channel is given up as down.
 pub const SILENCE_TO_DOWN: Duration = Duration::from_secs(4);
 
-/// Cuánto tiene que sostenerse la degradación antes de declararla.
+/// How long degradation has to persist before it is declared.
 ///
-/// Un pico de mala suerte no es una degradación. Declararla a la primera
-/// produciría un vaivén de perfiles que cuesta más que la degradación misma.
+/// A patch of bad luck is not degradation. Declaring it on the first one would
+/// produce a churn of profiles that costs more than the degradation itself.
 pub const DEGRADE_DEBOUNCE: Duration = Duration::from_millis(1500);
 
-/// Qué le pasó al canal.
+/// What happened to the channel.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Transition {
-    /// Empezó a sondear.
+    /// Probing started.
     ProbingStarted,
-    /// Quedó operativo.
+    /// It became operational.
     CameUp,
-    /// Empezó a sufrir de forma sostenida.
+    /// It began struggling persistently.
     Degraded,
-    /// Volvió a ir bien.
+    /// It went back to working well.
     Recovered,
-    /// Se cayó.
+    /// It went down.
     WentDown,
 }
 
-/// Máquina de estados de un canal.
+/// A channel's state machine.
 #[derive(Debug, Clone)]
 pub struct Lifecycle {
     state: LinkState,
@@ -75,7 +75,7 @@ impl Lifecycle {
         self.state
     }
 
-    /// Arranca la búsqueda de perfil.
+    /// Starts the profile search.
     pub fn start_probing(&mut self) -> Option<Transition> {
         if self.state == LinkState::Probing {
             return None;
@@ -84,7 +84,7 @@ impl Lifecycle {
         Some(Transition::ProbingStarted)
     }
 
-    /// Declara el canal operativo con el perfil ya elegido.
+    /// Declares the channel operational with the profile already chosen.
     pub fn bring_up(&mut self) -> Option<Transition> {
         if self.state == LinkState::Up {
             return None;
@@ -95,7 +95,7 @@ impl Lifecycle {
         Some(Transition::CameUp)
     }
 
-    /// Incorpora una observación de calidad.
+    /// Takes in a quality observation.
     pub fn observe(&mut self, now: Duration, success_rate: f32) -> Option<Transition> {
         self.now = now;
         if matches!(self.state, LinkState::Down | LinkState::Probing) {
@@ -112,15 +112,15 @@ impl Lifecycle {
             return None;
         }
 
-        let desde = *self.degraded_since.get_or_insert(now);
-        if self.state == LinkState::Up && now.saturating_sub(desde) >= DEGRADE_DEBOUNCE {
+        let since = *self.degraded_since.get_or_insert(now);
+        if self.state == LinkState::Up && now.saturating_sub(since) >= DEGRADE_DEBOUNCE {
             self.state = LinkState::Degraded;
             return Some(Transition::Degraded);
         }
         None
     }
 
-    /// Mueve el reloj sin observación nueva.
+    /// Advances the clock with no new observation.
     pub fn tick(&mut self, now: Duration) -> Option<Transition> {
         self.now = now;
         if matches!(self.state, LinkState::Down | LinkState::Probing) {
@@ -136,7 +136,8 @@ impl Lifecycle {
         None
     }
 
-    /// Fuerza la caída, por ejemplo al desaparecer el dispositivo de captura.
+    /// Forces the channel down, for instance when the capture device
+    /// disappears.
     pub fn force_down(&mut self) -> Option<Transition> {
         if self.state == LinkState::Down {
             return None;
@@ -147,7 +148,7 @@ impl Lifecycle {
         Some(Transition::WentDown)
     }
 
-    /// Si el canal sirve para transportar algo ahora mismo.
+    /// Whether the channel can carry anything right now.
     #[must_use]
     pub fn usable(&self) -> bool {
         matches!(self.state, LinkState::Up | LinkState::Degraded)

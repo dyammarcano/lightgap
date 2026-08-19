@@ -1,9 +1,9 @@
-//! Capa física visual: bytes ⇄ códigos en pantalla ⇄ píxeles de cámara.
+//! The visual physical layer: bytes to on-screen codes to camera pixels.
 //!
-//! Este crate es el único que sabe qué es un QR. El protocolo
-//! ([`optical_protocol`]) no lo sabe y no debe saberlo: esa separación es la
-//! que permitirá añadir el canal acústico —o Data Matrix, o una matriz binaria
-//! propia— sin tocar la capa de transporte.
+//! This crate is the only one that knows what a QR code is. The protocol
+//! ([`optical_protocol`]) does not, and must not: that separation is what will
+//! let the acoustic channel — or Data Matrix, or a bespoke binary matrix — be
+//! added without touching the transport layer.
 
 pub mod decode;
 pub mod distort;

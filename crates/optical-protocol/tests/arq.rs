@@ -1,8 +1,8 @@
-//! Tests de la ventana deslizante, sin canal de por medio.
+//! Sliding-window tests, with no channel in between.
 //!
-//! Aquí se prueba la lógica pura: qué emite el emisor, qué acepta el receptor y
-//! qué se cuentan entre ellos. La transferencia de extremo a extremo sobre un
-//! medio con pérdida vive en `channel-sim`, que es quien tiene el simulador.
+//! This exercises the pure logic: what the sender emits, what the receiver
+//! accepts, and what they tell each other. End-to-end transfer over a lossy
+//! medium lives in `channel-sim`, which owns the simulator.
 
 use optical_protocol::reliability::arq::{
     ArqReceiver, ArqSender, DEFAULT_WINDOW, MAX_MISSING_REPORTED,
@@ -11,92 +11,92 @@ use optical_protocol::reliability::{Feedback, Receiver, RecvError, Sender, Symbo
 
 const CS: usize = 100;
 
-fn objeto(len: usize) -> Vec<u8> {
-    // Patrón no repetitivo: si el receptor coloca un chunk en el sitio
-    // equivocado, un relleno constante lo ocultaría.
+fn object(len: usize) -> Vec<u8> {
+    // Non-repeating pattern: if the receiver places a chunk at the wrong offset,
+    // constant filler would hide it.
     (0..len).map(|i| (i % 251) as u8).collect()
 }
 
-/// Conecta emisor y receptor sin pérdidas, realimentando en cada vuelta.
-fn transferir(sender: &mut ArqSender, receiver: &mut ArqReceiver, max_payload: usize) -> usize {
-    let mut vueltas = 0;
+/// Wires sender and receiver together losslessly, feeding back every round.
+fn transfer(sender: &mut ArqSender, receiver: &mut ArqReceiver, max_payload: usize) -> usize {
+    let mut rounds = 0;
     while !sender.is_complete() {
-        vueltas += 1;
-        assert!(vueltas < 100_000, "no converge");
+        rounds += 1;
+        assert!(rounds < 100_000, "does not converge");
 
         if let Some(sym) = sender.next_symbol(max_payload) {
-            receiver.on_symbol(&sym).expect("símbolo válido");
+            receiver.on_symbol(&sym).expect("valid symbol");
         }
         sender.on_feedback(&receiver.feedback());
     }
-    vueltas
+    rounds
 }
 
 #[test]
-fn transferencia_limpia_reconstruye_el_objeto_exacto() {
-    let original = objeto(1000);
+fn a_clean_transfer_reconstructs_the_object_exactly() {
+    let original = object(1000);
     let mut tx = ArqSender::new(original.clone(), CS);
     let mut rx = ArqReceiver::new(original.len(), CS);
 
-    transferir(&mut tx, &mut rx, CS);
+    transfer(&mut tx, &mut rx, CS);
 
-    assert_eq!(rx.take_object().expect("completo"), original);
+    assert_eq!(rx.take_object().expect("complete"), original);
 }
 
 #[test]
-fn el_ultimo_chunk_corto_se_maneja() {
-    // 1050 = 10 chunks de 100 + uno de 50.
-    let original = objeto(1050);
+fn a_short_final_chunk_is_handled() {
+    // 1050 = ten chunks of 100 plus one of 50.
+    let original = object(1050);
     let mut tx = ArqSender::new(original.clone(), CS);
     let mut rx = ArqReceiver::new(original.len(), CS);
 
     assert_eq!(tx.total_chunks(), 11);
-    transferir(&mut tx, &mut rx, CS);
+    transfer(&mut tx, &mut rx, CS);
 
-    assert_eq!(rx.take_object().expect("completo"), original);
+    assert_eq!(rx.take_object().expect("complete"), original);
 }
 
 #[test]
-fn objeto_multiplo_exacto_no_genera_chunk_de_sobra() {
-    let original = objeto(1000);
+fn an_exact_multiple_does_not_produce_a_spare_chunk() {
+    let original = object(1000);
     let tx = ArqSender::new(original, CS);
-    assert_eq!(tx.total_chunks(), 10, "1000/100 son 10 chunks, no 11");
+    assert_eq!(tx.total_chunks(), 10, "1000/100 is ten chunks, not eleven");
 }
 
 #[test]
-fn objeto_vacio_esta_completo_de_entrada() {
+fn an_empty_object_is_complete_from_the_start() {
     let tx = ArqSender::new(Vec::new(), CS);
     let mut rx = ArqReceiver::new(0, CS);
 
-    assert!(tx.is_complete(), "no hay nada que enviar");
-    assert!(rx.is_complete(), "no hay nada que esperar");
+    assert!(tx.is_complete(), "nothing to send");
+    assert!(rx.is_complete(), "nothing to wait for");
     assert_eq!(rx.take_object(), Some(Vec::new()));
-    assert_eq!(rx.take_object(), None, "solo se entrega una vez");
+    assert_eq!(rx.take_object(), None, "handed over exactly once");
 }
 
 #[test]
-fn la_ventana_limita_los_simbolos_en_vuelo() {
-    let original = objeto(100 * 100);
+fn the_window_caps_symbols_in_flight() {
+    let original = object(100 * 100);
     let mut tx = ArqSender::new(original, CS);
 
-    // Sin realimentación ninguna, el emisor no debería pasar de la ventana.
-    let mut emitidos = 0;
+    // With no feedback at all, the sender must not exceed the window.
+    let mut emitted = 0;
     while tx.next_symbol(CS).is_some() {
-        emitidos += 1;
+        emitted += 1;
         assert!(
-            emitidos <= DEFAULT_WINDOW as usize,
-            "emitió {emitidos} sin confirmación, con ventana {DEFAULT_WINDOW}"
+            emitted <= DEFAULT_WINDOW as usize,
+            "emitted {emitted} without acknowledgement, window is {DEFAULT_WINDOW}"
         );
     }
-    assert_eq!(emitidos, DEFAULT_WINDOW as usize);
+    assert_eq!(emitted, DEFAULT_WINDOW as usize);
 }
 
 #[test]
-fn los_huecos_se_retransmiten_antes_que_lo_nuevo() {
-    let original = objeto(1000);
+fn gaps_are_retransmitted_before_new_data() {
+    let original = object(1000);
     let mut tx = ArqSender::new(original, CS);
 
-    // Se emiten los primeros cinco y se confirma que faltan el 1 y el 3.
+    // Send the first five, then report that 1 and 3 are missing.
     for _ in 0..5 {
         tx.next_symbol(CS).unwrap();
     }
@@ -106,26 +106,14 @@ fn los_huecos_se_retransmiten_antes_que_lo_nuevo() {
         window: DEFAULT_WINDOW as u16,
     });
 
-    assert_eq!(
-        tx.next_symbol(CS).unwrap().id,
-        1,
-        "primero el hueco más viejo"
-    );
-    assert_eq!(
-        tx.next_symbol(CS).unwrap().id,
-        3,
-        "luego el siguiente hueco"
-    );
-    assert_eq!(
-        tx.next_symbol(CS).unwrap().id,
-        5,
-        "y solo entonces datos nuevos"
-    );
+    assert_eq!(tx.next_symbol(CS).unwrap().id, 1, "oldest gap first");
+    assert_eq!(tx.next_symbol(CS).unwrap().id, 3, "then the next gap");
+    assert_eq!(tx.next_symbol(CS).unwrap().id, 5, "and only then new data");
 }
 
 #[test]
-fn un_hueco_ya_confirmado_no_se_retransmite() {
-    let original = objeto(1000);
+fn a_gap_already_covered_is_not_retransmitted() {
+    let original = object(1000);
     let mut tx = ArqSender::new(original, CS);
     for _ in 0..5 {
         tx.next_symbol(CS).unwrap();
@@ -136,7 +124,7 @@ fn un_hueco_ya_confirmado_no_se_retransmite() {
         missing: vec![2],
         window: DEFAULT_WINDOW as u16,
     });
-    // El acumulado avanza por encima del hueco: ya no hace falta.
+    // The cumulative point moves past the gap: it is no longer needed.
     tx.on_feedback(&Feedback::Selective {
         cumulative: 5,
         missing: vec![],
@@ -146,20 +134,20 @@ fn un_hueco_ya_confirmado_no_se_retransmite() {
     assert_eq!(
         tx.next_symbol(CS).unwrap().id,
         5,
-        "el hueco 2 quedó cubierto por el acumulado"
+        "gap 2 was covered by the cumulative acknowledgement"
     );
 }
 
 #[test]
-fn el_acumulado_nunca_retrocede() {
-    let mut tx = ArqSender::new(objeto(1000), CS);
+fn the_cumulative_point_never_moves_backwards() {
+    let mut tx = ArqSender::new(object(1000), CS);
     tx.on_feedback(&Feedback::Selective {
         cumulative: 7,
         missing: vec![],
         window: 0,
     });
-    // Una confirmación vieja que llega tarde no debe deshacer el avance: en un
-    // canal con reordenamiento esto pasa de verdad.
+    // A stale acknowledgement arriving late must not undo progress: on a channel
+    // that reorders, this genuinely happens.
     tx.on_feedback(&Feedback::Selective {
         cumulative: 3,
         missing: vec![],
@@ -169,34 +157,34 @@ fn el_acumulado_nunca_retrocede() {
 }
 
 #[test]
-fn realimentacion_de_otro_modo_se_ignora_sin_romper() {
-    let mut tx = ArqSender::new(objeto(1000), CS);
+fn feedback_from_another_mode_is_ignored_without_breaking() {
+    let mut tx = ArqSender::new(object(1000), CS);
     tx.on_feedback(&Feedback::Fountain {
         complete: true,
         received: 999,
     });
     assert!(
         !tx.is_complete(),
-        "una realimentación de fuente no debería completar una transferencia ARQ"
+        "fountain feedback must not complete an ARQ transfer"
     );
 }
 
 #[test]
-fn un_duplicado_no_es_un_error() {
+fn a_duplicate_is_not_an_error() {
     let mut rx = ArqReceiver::new(1000, CS);
     let sym = Symbol {
         id: 0,
         bytes: vec![7; CS],
     };
 
-    rx.on_symbol(&sym).expect("primera vez");
+    rx.on_symbol(&sym).expect("first time");
     rx.on_symbol(&sym)
-        .expect("el medio duplica solo; no es error");
-    assert_eq!(rx.progress().have, 1, "no debería contar dos veces");
+        .expect("the medium duplicates on its own; not an error");
+    assert_eq!(rx.progress().have, 1, "must not count twice");
 }
 
 #[test]
-fn un_simbolo_de_tamano_erroneo_se_rechaza() {
+fn a_wrongly_sized_symbol_is_rejected() {
     let mut rx = ArqReceiver::new(1000, CS);
     let err = rx
         .on_symbol(&Symbol {
@@ -214,7 +202,7 @@ fn un_simbolo_de_tamano_erroneo_se_rechaza() {
 }
 
 #[test]
-fn un_identificador_fuera_de_rango_se_rechaza() {
+fn an_out_of_range_identifier_is_rejected() {
     let mut rx = ArqReceiver::new(1000, CS);
     let err = rx
         .on_symbol(&Symbol {
@@ -226,57 +214,54 @@ fn un_identificador_fuera_de_rango_se_rechaza() {
 }
 
 #[test]
-fn la_lista_de_huecos_esta_acotada() {
-    // Muchos más huecos que el límite: la realimentación tiene que caber en un
-    // marco, así que se recortan.
+fn the_gap_list_is_bounded() {
+    // Far more gaps than the limit: the feedback has to fit in a frame, so it
+    // gets trimmed.
     let total = (MAX_MISSING_REPORTED + 50) * CS;
     let mut rx = ArqReceiver::new(total, CS);
 
-    // Se recibe solo el último chunk: todo lo anterior queda como hueco.
-    let ultimo = (total / CS - 1) as u32;
+    // Receive only the last chunk: everything before it is a gap.
+    let last = (total / CS - 1) as u32;
     rx.on_symbol(&Symbol {
-        id: ultimo,
+        id: last,
         bytes: vec![0; CS],
     })
     .unwrap();
 
     let Feedback::Selective { missing, .. } = rx.feedback() else {
-        panic!("ARQ debe producir realimentación selectiva");
+        panic!("ARQ must produce selective feedback");
     };
     assert_eq!(missing.len(), MAX_MISSING_REPORTED);
     assert_eq!(
         missing[0], 0,
-        "se reportan los más viejos, que son los que bloquean"
+        "the oldest are reported, since they are what blocks progress"
     );
 }
 
 #[test]
-fn un_simbolo_que_no_cabe_no_se_emite() {
-    let mut tx = ArqSender::new(objeto(1000), CS);
+fn a_symbol_that_does_not_fit_is_not_emitted() {
+    let mut tx = ArqSender::new(object(1000), CS);
     assert!(
         tx.next_symbol(CS - 1).is_none(),
-        "con menos espacio que el chunk no debe emitir nada"
+        "with less room than a chunk it must emit nothing"
     );
-    assert_eq!(tx.progress().have, 0, "y el estado no debe haber avanzado");
-    assert!(
-        tx.next_symbol(CS).is_some(),
-        "con espacio suficiente sí emite"
-    );
+    assert_eq!(tx.progress().have, 0, "and state must not have advanced");
+    assert!(tx.next_symbol(CS).is_some(), "with room it does emit");
 }
 
 #[test]
-fn el_objeto_solo_se_entrega_una_vez() {
-    let original = objeto(300);
+fn the_object_is_handed_over_exactly_once() {
+    let original = object(300);
     let mut tx = ArqSender::new(original.clone(), CS);
     let mut rx = ArqReceiver::new(original.len(), CS);
-    transferir(&mut tx, &mut rx, CS);
+    transfer(&mut tx, &mut rx, CS);
 
     assert_eq!(rx.take_object(), Some(original));
     assert_eq!(rx.take_object(), None);
 }
 
 #[test]
-fn sin_todos_los_chunks_no_se_entrega_nada() {
+fn nothing_is_handed_over_until_every_chunk_arrives() {
     let mut rx = ArqReceiver::new(300, CS);
     rx.on_symbol(&Symbol {
         id: 0,
@@ -290,14 +275,14 @@ fn sin_todos_los_chunks_no_se_entrega_nada() {
     .unwrap();
 
     assert!(!rx.is_complete());
-    assert_eq!(rx.take_object(), None, "falta el chunk 1");
+    assert_eq!(rx.take_object(), None, "chunk 1 is missing");
 }
 
 #[test]
-fn el_orden_de_llegada_no_altera_el_resultado() {
-    let original = objeto(1000);
+fn arrival_order_does_not_change_the_result() {
+    let original = object(1000);
 
-    let reconstruir = |ids: Vec<u32>| {
+    let rebuild = |ids: Vec<u32>| {
         let mut rx = ArqReceiver::new(original.len(), CS);
         for id in ids {
             let start = id as usize * CS;
@@ -310,11 +295,11 @@ fn el_orden_de_llegada_no_altera_el_resultado() {
         rx.take_object()
     };
 
-    let directo: Vec<u32> = (0..10).collect();
-    let inverso: Vec<u32> = (0..10).rev().collect();
-    let barajado = vec![3, 7, 0, 9, 1, 5, 8, 2, 6, 4];
+    let forward: Vec<u32> = (0..10).collect();
+    let backward: Vec<u32> = (0..10).rev().collect();
+    let shuffled = vec![3, 7, 0, 9, 1, 5, 8, 2, 6, 4];
 
-    assert_eq!(reconstruir(directo), Some(original.clone()));
-    assert_eq!(reconstruir(inverso), Some(original.clone()));
-    assert_eq!(reconstruir(barajado), Some(original));
+    assert_eq!(rebuild(forward), Some(original.clone()));
+    assert_eq!(rebuild(backward), Some(original.clone()));
+    assert_eq!(rebuild(shuffled), Some(original));
 }

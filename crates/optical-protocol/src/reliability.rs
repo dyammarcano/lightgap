@@ -1,37 +1,38 @@
-//! Cómo se garantiza que el objeto llega entero.
+//! How delivery of the whole object is guaranteed.
 //!
-//! Hay dos estrategias y se eligen por perfil, no por religión:
+//! There are two strategies, chosen per profile rather than by conviction:
 //!
-//! - **Fuente (RaptorQ).** El emisor genera símbolos codificados sin parar y sin
-//!   esperar nada. El receptor decodifica cuando junta suficientes, da igual
-//!   cuáles. Elimina el round-trip óptico, que en este medio es el coste
-//!   dominante: mostrar un QR, capturarlo, decodificarlo y responder con otro QR
-//!   cuesta cientos de milisegundos.
-//! - **ARQ.** Ventana deslizante con retransmisión selectiva. Cada confirmación
-//!   cuesta un round-trip completo, pero da control fino y no desperdicia ancho
-//!   de banda cuando el canal está limpio.
+//! - **Fountain (RaptorQ).** The sender emits coded symbols continuously and
+//!   waits for nothing. The receiver reconstructs once it has gathered enough,
+//!   regardless of *which* ones. This removes the optical round trip, which is
+//!   the dominant cost in this medium — showing a QR code, capturing it,
+//!   decoding it and answering with another QR code costs hundreds of
+//!   milliseconds.
+//! - **ARQ.** Sliding window with selective retransmission. Every
+//!   acknowledgement costs a full round trip, but it gives fine control and
+//!   wastes no bandwidth when the channel is clean.
 //!
-//! Emisor y receptor son traits separados a propósito. Son papeles asimétricos
-//! —con fuente el emisor no necesita saber nada del receptor hasta el final— y
-//! meterlos en un solo trait dejaría la mitad de los métodos vacíos en cada
-//! implementación.
+//! Sender and receiver are separate traits on purpose. They are asymmetric
+//! roles — with fountain coding the sender needs to know nothing about the
+//! receiver until the very end — and folding them into one trait would leave
+//! half the methods empty in each implementation.
 
 pub mod arq;
 pub mod fountain;
 
 use crate::wire::Flags;
 
-/// Qué estrategia usa una transferencia.
+/// Which strategy a transfer uses.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Mode {
-    /// RaptorQ. Sin orden, sin retransmisión explícita, sin esperas.
+    /// RaptorQ. No ordering, no explicit retransmission, no waiting.
     Fountain,
-    /// Ventana deslizante con retransmisión selectiva.
+    /// Sliding window with selective retransmission.
     Arq,
 }
 
 impl Mode {
-    /// Bandera que debe llevar un PDU de datos de este modo.
+    /// The flag a data PDU of this mode must carry.
     #[must_use]
     pub const fn flag(self) -> Flags {
         match self {
@@ -41,32 +42,32 @@ impl Mode {
     }
 }
 
-/// Una porción del objeto lista para viajar.
+/// A piece of the object ready to travel.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Symbol {
-    /// Identificador. Va en `Pdu::seq`.
+    /// Identifier. Goes in `Pdu::seq`.
     ///
-    /// En ARQ es el índice del chunk y es denso. En fuente es el identificador
-    /// del símbolo codificado y crece indefinidamente: el emisor puede generar
-    /// muchos más símbolos que chunks tiene el objeto, y eso es justamente el
-    /// mecanismo, no un defecto.
+    /// Under ARQ this is the chunk index and is dense. Under fountain coding it
+    /// is the coded symbol identifier and grows without bound: the sender can
+    /// generate far more symbols than the object has chunks, and that is the
+    /// mechanism rather than a defect.
     pub id: u32,
     pub bytes: Vec<u8>,
 }
 
-/// Cuánto queda. Sirve para la barra de progreso y para que el multiplexor sepa
-/// si merece la pena seguir invirtiendo ancho de banda en esta transferencia.
+/// How much is left. Feeds the progress bar, and lets the multiplexer judge
+/// whether this transfer is still worth spending bandwidth on.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct Progress {
-    /// Unidades ya resueltas (chunks confirmados, o símbolos útiles reunidos).
+    /// Units already resolved: acknowledged chunks, or useful symbols gathered.
     pub have: u64,
-    /// Unidades necesarias para terminar.
+    /// Units needed to finish.
     pub need: u64,
 }
 
 impl Progress {
-    /// Fracción completada en 0..=1. Devuelve 1 si no hace falta nada, para que
-    /// un objeto vacío no se quede colgado en el 0 %.
+    /// Completed fraction in 0..=1. Returns 1 when nothing is needed, so an
+    /// empty object does not sit forever at 0%.
     #[must_use]
     pub fn fraction(&self) -> f32 {
         if self.need == 0 {
@@ -76,37 +77,37 @@ impl Progress {
     }
 }
 
-/// Lo que el receptor le cuenta al emisor.
+/// What the receiver tells the sender.
 ///
-/// Va en el payload de un PDU `Ack`. Los dos modos necesitan decir cosas
-/// distintas, y forzarlos a un formato común haría que uno de los dos mintiera.
+/// Travels in the payload of an `Ack` PDU. The two modes need to say different
+/// things, and forcing them into a shared shape would make one of them lie.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Feedback {
-    /// ARQ: todo hasta `cumulative` (exclusivo) está, y de lo posterior faltan
-    /// los que se listan.
+    /// ARQ: everything below `cumulative` is in hand, and of what follows the
+    /// listed indices are missing.
     Selective {
         cumulative: u32,
         missing: Vec<u32>,
-        /// Cuántos símbolos más admite la ventana del receptor.
+        /// How many more symbols the receiver's window will accept.
         window: u16,
     },
-    /// Fuente: al emisor solo le importa si ya puede parar. Cuántos símbolos
-    /// van reunidos sirve para estimar cuánto falta, no para decidir qué
-    /// reenviar —en fuente no se reenvía nada concreto.
+    /// Fountain: the sender only cares whether it can stop. The count of
+    /// gathered symbols is for estimating what is left, not for deciding what to
+    /// resend — under fountain coding nothing specific is resent.
     Fountain { complete: bool, received: u32 },
 }
 
-/// Etiquetas de los dos dialectos de realimentación en el cable.
+/// Wire tags for the two feedback dialects.
 const FB_SELECTIVE: u8 = 1;
 const FB_FOUNTAIN: u8 = 2;
 
 impl Feedback {
-    /// Serializa para viajar en el payload de un PDU `Ack`.
+    /// Serializes for travel in the payload of an `Ack` PDU.
     ///
-    /// La lista de huecos ya viene acotada por quien la produce
-    /// ([`arq::MAX_MISSING_REPORTED`]); aquí no se recorta nada, porque
-    /// silenciar huecos a última hora dejaría al emisor creyendo que ya los
-    /// mandó todos.
+    /// The gap list arrives already bounded by whoever produced it (see
+    /// [`arq::MAX_MISSING_REPORTED`]); nothing is trimmed here, because
+    /// silently dropping gaps at the last moment would leave the sender
+    /// believing it had already sent them all.
     #[must_use]
     pub fn encode(&self) -> Vec<u8> {
         let mut out = Vec::new();
@@ -134,12 +135,12 @@ impl Feedback {
         out
     }
 
-    /// Interpreta lo que venía en un PDU `Ack`.
+    /// Interprets what arrived in an `Ack` PDU.
     ///
-    /// Devuelve `None` ante cualquier cosa que no cuadre. El CRC ya descartó los
-    /// marcos corruptos, así que llegar aquí con basura significa que el par
-    /// habla otro dialecto — y eso se trata ignorando el mensaje, no rompiendo
-    /// la sesión.
+    /// Returns `None` for anything that does not add up. The CRC already
+    /// discarded corrupt frames, so reaching here with garbage means the peer
+    /// speaks a different dialect — and that is handled by ignoring the message,
+    /// not by tearing down the session.
     #[must_use]
     pub fn decode(buf: &[u8]) -> Option<Self> {
         let (&tag, rest) = buf.split_first()?;
@@ -179,47 +180,47 @@ impl Feedback {
     }
 }
 
-/// Por qué un símbolo entrante no se pudo incorporar.
+/// Why an incoming symbol could not be taken in.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum RecvError {
-    #[error("símbolo de {got} B, se esperaban {expected}")]
+    #[error("symbol of {got} B, expected {expected}")]
     SymbolSize { got: usize, expected: usize },
 
-    #[error("identificador {id} fuera del objeto ({chunks} chunks)")]
+    #[error("identifier {id} falls outside the object ({chunks} chunks)")]
     OutOfRange { id: u32, chunks: u32 },
 }
 
-/// El lado que tiene el objeto y lo va soltando.
+/// The side that holds the object and pays it out.
 pub trait Sender {
-    /// Siguiente porción a transmitir, limitada a `max_payload` bytes.
+    /// Next piece to transmit, capped at `max_payload` bytes.
     ///
-    /// Devolver `None` significa "ahora mismo no hay nada que mandar", no
-    /// "terminé": con ARQ la ventana puede estar llena esperando confirmación.
-    /// Para saber si terminó está [`Sender::is_complete`].
+    /// Returning `None` means "nothing to send right now", not "finished": under
+    /// ARQ the window may be full awaiting acknowledgement. Use
+    /// [`Sender::is_complete`] to learn whether it is done.
     fn next_symbol(&mut self, max_payload: usize) -> Option<Symbol>;
 
-    /// Incorpora lo que el receptor ha contado.
+    /// Takes in what the receiver reported.
     fn on_feedback(&mut self, feedback: &Feedback);
 
-    /// El receptor ya tiene el objeto entero y se puede dejar de emitir.
+    /// The receiver has the whole object and emission can stop.
     fn is_complete(&self) -> bool;
 
     fn progress(&self) -> Progress;
 }
 
-/// El lado que reúne las porciones y reconstruye.
+/// The side that gathers pieces and reassembles.
 pub trait Receiver {
-    /// Incorpora un símbolo recibido.
+    /// Takes in a received symbol.
     fn on_symbol(&mut self, symbol: &Symbol) -> Result<(), RecvError>;
 
-    /// Qué contarle al emisor ahora mismo.
+    /// What to tell the sender right now.
     fn feedback(&self) -> Feedback;
 
-    /// Devuelve el objeto reconstruido, una sola vez.
+    /// Yields the reconstructed object, once.
     ///
-    /// Consume el resultado a propósito: reconstruir un objeto de varios MB no
-    /// es gratis, y devolverlo por referencia invitaría a copiarlo en cada
-    /// consulta de progreso.
+    /// Deliberately consuming: reconstructing a multi-megabyte object is not
+    /// free, and handing it back by reference would invite copying it on every
+    /// progress query.
     fn take_object(&mut self) -> Option<Vec<u8>>;
 
     fn progress(&self) -> Progress;

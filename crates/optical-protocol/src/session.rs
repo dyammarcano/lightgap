@@ -1,25 +1,25 @@
-//! Máquina de estados de la sesión.
+//! Session state machine.
 //!
-//! Es deliberadamente pequeña. El boceto original de este proyecto metía
-//! `AudioNoiseMeasurement`, `AudioFrequencySweep` y compañía como estados de
-//! *sesión*, lo que ata la sesión al audio: añadir un tercer medio obligaría a
-//! editar esta máquina. Aquí la calibración es asunto de cada canal, que lleva
-//! su propio ciclo de vida ([`crate::channel`]), y la sesión solo sabe si hay
-//! par, si está negociando y si está transfiriendo.
+//! Deliberately small. The original sketch for this project put
+//! `AudioNoiseMeasurement`, `AudioFrequencySweep` and friends in as *session*
+//! states, which ties the session to audio: adding a third medium would force an
+//! edit here. In this design calibration belongs to each channel, which carries
+//! its own lifecycle, and the session only knows whether there is a peer,
+//! whether it is negotiating, and whether it is transferring.
 //!
-//! No hace entrada/salida: se le entregan PDUs, se le pregunta qué transmitir y
-//! se le avisa del paso del tiempo. Quien manda el reloj es quien llama.
+//! It performs no I/O: you hand it PDUs, ask what to transmit, and tell it that
+//! time has passed. The caller owns the clock.
 
 use core::fmt;
 use core::time::Duration;
 
 use crate::wire::{Flags, Pdu, PduKind};
 
-/// Identificador de par. Se sortea al arrancar la aplicación.
+/// Peer identifier, drawn when the application starts.
 ///
-/// Dieciséis bytes para que dos instancias no coincidan por accidente: con
-/// menos, una colisión dejaría la elección de líder sin desempate y las dos
-/// máquinas se quedarían esperándose.
+/// Sixteen bytes so two instances do not collide by accident: with fewer, a
+/// collision would leave leader election without a tie-break and both machines
+/// would sit waiting for each other.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct PeerId(pub [u8; 16]);
 
@@ -37,7 +37,7 @@ impl PeerId {
 
 impl fmt::Display for PeerId {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        // Los cuatro primeros bytes bastan para distinguir en un registro.
+        // Four bytes are enough to tell peers apart in a log line.
         for b in &self.0[..4] {
             write!(f, "{b:02x}")?;
         }
@@ -45,67 +45,67 @@ impl fmt::Display for PeerId {
     }
 }
 
-/// Quién dirige la sesión.
+/// Who drives the session.
 ///
-/// Dos aplicaciones idénticas mirándose necesitan un desempate: si ninguna
-/// arranca la calibración, se quedan esperando; si las dos emiten el barrido
-/// acústico a la vez, cada micrófono capta su propio altavoz y la medida no
-/// vale nada. El criterio es el `PeerId` menor.
+/// Two identical applications facing each other need a tie-break: if neither
+/// starts calibration they wait forever, and if both emit the acoustic sweep at
+/// once each microphone picks up its own speaker and the measurement is
+/// worthless. The rule is the lower `PeerId` wins.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Role {
-    /// Secuencia la calibración y fija el identificador de sesión.
+    /// Sequences calibration and fixes the session identifier.
     Leader,
-    /// Sigue el ritmo que marca el líder.
+    /// Follows the leader's pacing.
     Follower,
 }
 
-/// En qué punto está la sesión.
+/// Where the session stands.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum State {
-    /// Emitiendo `Hello` y buscando a alguien enfrente.
+    /// Emitting `Hello` and looking for someone across the way.
     Discovering,
-    /// Los dos se han visto; ya hay papeles repartidos.
+    /// Both sides have seen each other; roles are assigned.
     Peered,
-    /// Acordando perfiles de canal.
+    /// Agreeing on channel profiles.
     Negotiating,
-    /// Moviendo datos.
+    /// Moving data.
     Active,
-    /// Cerrando de mutuo acuerdo.
+    /// Closing by mutual agreement.
     Closing,
-    /// Terminada.
+    /// Finished.
     Closed,
 }
 
-/// Lo que le pasa a quien usa la sesión.
+/// What happened, for whoever drives the session.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Event {
-    /// Se ha visto al otro lado y se han repartido papeles.
+    /// The other side was seen and roles were assigned.
     PeerDiscovered { peer: PeerId, role: Role },
-    /// Se pasó a negociar perfiles.
+    /// Profile negotiation began.
     NegotiationStarted,
-    /// Todo listo para transferir.
+    /// Ready to transfer.
     Ready,
-    /// El par lleva demasiado tiempo callado.
+    /// The peer has been quiet for too long.
     PeerLost,
-    /// Sesión terminada, con o sin acuerdo.
+    /// Session over, with or without agreement.
     Closed,
 }
 
-/// Cada cuánto se repite el `Hello` mientras se busca par.
+/// How often `Hello` repeats while looking for a peer.
 ///
-/// Lento a propósito: durante el descubrimiento nadie está encuadrado todavía,
-/// y un QR que cambia deprisa es más difícil de enganchar que uno que se queda
-/// quieto medio segundo.
+/// Slow on purpose: during discovery nobody is framed yet, and a QR code that
+/// changes quickly is harder to latch onto than one that sits still for half a
+/// second.
 pub const HELLO_INTERVAL: Duration = Duration::from_millis(500);
 
-/// Sin noticias durante este tiempo, se da al par por perdido.
+/// With no news for this long, the peer is given up for lost.
 ///
-/// Generoso frente al ritmo de `Hello`: un enlace óptico pierde marcos por
-/// rachas —una mano que pasa, un reflejo— y cortar a la primera racha haría
-/// que la sesión se cayera constantemente.
+/// Generous relative to the `Hello` rate: an optical link loses frames in bursts
+/// — a passing hand, a reflection — and cutting at the first burst would have
+/// the session collapsing constantly.
 pub const PEER_TIMEOUT: Duration = Duration::from_secs(5);
 
-/// La sesión.
+/// The session.
 #[derive(Debug)]
 pub struct Session {
     local: PeerId,
@@ -150,7 +150,7 @@ impl Session {
         self.remote
     }
 
-    /// Identificador de sesión acordado. Cero mientras no haya par.
+    /// Agreed session identifier. Zero while there is no peer.
     #[must_use]
     pub fn session_id(&self) -> u64 {
         self.session_id
@@ -161,12 +161,12 @@ impl Session {
         self.local
     }
 
-    /// Deriva el identificador de sesión de los dos identificadores de par.
+    /// Derives the session identifier from the two peer identifiers.
     ///
-    /// Determinista y simétrico: los dos lados llegan al mismo número sin
-    /// negociarlo, así que no hace falta un intercambio extra ni que el líder
-    /// lo imponga. Se mezcla con el mismo entero que usa `SimPair` para
-    /// separar semillas, elegido por tener buena dispersión de bits.
+    /// Deterministic and symmetric: both sides arrive at the same number without
+    /// negotiating it, so no extra exchange is needed and the leader does not
+    /// have to impose one. Mixed with the same constant `SimPair` uses to
+    /// separate seeds, chosen for its good bit dispersion.
     fn derive_session_id(a: &PeerId, b: &PeerId) -> u64 {
         let (lo, hi) = if a <= b { (a, b) } else { (b, a) };
         let mut acc: u64 = 0x9e37_79b9_7f4a_7c15;
@@ -174,7 +174,7 @@ impl Session {
             acc ^= u64::from(*byte);
             acc = acc.wrapping_mul(0x0100_0000_01b3);
         }
-        // Cero queda reservado para «todavía no hay sesión».
+        // Zero is reserved for "no session yet".
         acc | 1
     }
 
@@ -189,7 +189,7 @@ impl Session {
         }
     }
 
-    /// Incorpora un PDU recibido.
+    /// Takes in a received PDU.
     pub fn handle_incoming(&mut self, pdu: &Pdu) -> Vec<Event> {
         if self.state == State::Closed {
             return Vec::new();
@@ -200,15 +200,16 @@ impl Session {
         match pdu.kind {
             PduKind::Hello => {
                 let Ok(bytes) = <[u8; 16]>::try_from(pdu.payload.as_slice()) else {
-                    // Un `Hello` con identificador de otro tamaño es de otra
-                    // versión del protocolo. Se ignora: no hay forma de repartir
-                    // papeles con alguien cuyo identificador no se entiende.
+                    // A `Hello` carrying a differently sized identifier belongs
+                    // to another protocol version. Ignore it: there is no way to
+                    // assign roles against a peer whose identifier is
+                    // unintelligible.
                     return events;
                 };
                 let remote = PeerId::from_bytes(bytes);
                 if remote == self.local {
-                    // Verse a uno mismo (un espejo, o la propia pantalla en el
-                    // encuadre) no es descubrir un par.
+                    // Seeing yourself — a mirror, or your own screen in frame —
+                    // is not discovering a peer.
                     return events;
                 }
 
@@ -242,14 +243,13 @@ impl Session {
         events
     }
 
-    /// Qué transmitir ahora, si toca algo.
+    /// What to transmit now, if anything is due.
     pub fn poll_transmit(&mut self) -> Option<Pdu> {
         if let Some(pdu) = self.pending.take() {
             return Some(pdu);
         }
-        // El `Hello` se sigue repitiendo tras encontrar par: el otro lado puede
-        // no haber visto el nuestro todavía, y el descubrimiento no es
-        // simétrico en el tiempo.
+        // `Hello` keeps repeating after a peer is found: the other side may not
+        // have seen ours yet, and discovery is not symmetric in time.
         if matches!(self.state, State::Discovering | State::Peered) && self.now >= self.next_hello {
             self.next_hello = self.now + HELLO_INTERVAL;
             return Some(self.hello());
@@ -257,7 +257,7 @@ impl Session {
         None
     }
 
-    /// Mueve el reloj. Devuelve lo que el paso del tiempo haya provocado.
+    /// Advances the clock. Returns whatever the passage of time triggered.
     pub fn handle_timeout(&mut self, now: Duration) -> Vec<Event> {
         self.now = now;
         let mut events = Vec::new();
@@ -273,8 +273,8 @@ impl Session {
                 self.session_id = 0;
                 self.state = State::Discovering;
                 self.last_rx = None;
-                // Se reanuda el `Hello` de inmediato: quien acaba de perder al
-                // par es quien más prisa tiene por volver a anunciarse.
+                // Resume announcing immediately: whoever just lost the peer is
+                // the one in the biggest hurry to be found again.
                 self.next_hello = now;
                 events.push(Event::PeerLost);
             }
@@ -283,11 +283,11 @@ impl Session {
         events
     }
 
-    /// Declara acordados los perfiles y pasa a transferir.
+    /// Declares profiles agreed and moves to transferring.
     ///
-    /// Lo decide la capa de calibración, no la sesión: la sesión no sabe qué es
-    /// un perfil visual ni uno acústico, y meterle ese conocimiento sería
-    /// reintroducir justo el acoplamiento que este diseño evita.
+    /// Decided by the calibration layer, not by the session: the session does
+    /// not know what a visual or acoustic profile is, and teaching it would
+    /// reintroduce exactly the coupling this design avoids.
     pub fn mark_ready(&mut self) -> Vec<Event> {
         if matches!(self.state, State::Peered | State::Negotiating) {
             self.state = State::Active;
@@ -296,7 +296,7 @@ impl Session {
         Vec::new()
     }
 
-    /// Cierra la sesión y deja preparado el aviso al par.
+    /// Closes the session and queues the notice to the peer.
     pub fn close(&mut self) -> Vec<Event> {
         if self.state == State::Closed {
             return Vec::new();

@@ -1,5 +1,5 @@
-// FASE 0: se monta el spike; `app` es la plantilla original, se conserva
-// intacta para volver a ella al terminar la medicion.
+// PHASE 0: the spike is mounted; `app` is the original template, kept intact so
+// we can go back to it once the measurement is done.
 #[allow(dead_code)]
 mod app;
 mod spike;

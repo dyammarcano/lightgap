@@ -1,70 +1,70 @@
-//! Formato de wire de la unidad de protocolo (PDU).
+//! Wire format for the protocol data unit (PDU).
 //!
-//! A mano y con layout fijo, no `bincode`: bincode no promete estabilidad de
-//! representación entre versiones, y esto es un formato que dos máquinas
-//! distintas —potencialmente con binarios de fechas distintas— tienen que
-//! interpretar igual.
+//! Hand-rolled with a fixed layout rather than `bincode`: bincode makes no
+//! stability promise about its representation across versions, and this is a
+//! format that two different machines — potentially running binaries built
+//! months apart — have to interpret identically.
 //!
-//! Little-endian en todos los campos.
+//! Little-endian throughout.
 //!
 //! ```text
-//! off  tam  campo
-//!   0    1  version
-//!   1    8  session_id
-//!   9    1  kind
-//!  10    2  flags
-//!  12    4  seq
-//!  16    4  ack
-//!  20    2  payload_len
-//!  22    N  payload
-//! 22+N    4  crc32   (sobre todo lo anterior)
+//! off  size  field
+//!   0     1  version
+//!   1     8  session_id
+//!   9     1  kind
+//!  10     2  flags
+//!  12     4  seq
+//!  16     4  ack
+//!  20     2  payload_len
+//!  22     N  payload
+//! 22+N     4  crc32   (over everything before it)
 //! ```
 //!
-//! Sobre el tamaño de `session_id`: 8 B por PDU sobre un payload de ~900 B es
-//! un 0,9 %. Recortarlo a u32 ahorraría un 0,4 % a cambio de mantener dos
-//! identificadores distintos (el completo en la sesión, el truncado en el
-//! wire). El diseño ahorra bytes cuando es gratis —el nonce de ChaCha20 se
-//! deriva y no viaja— pero no cuando cuesta claridad.
+//! On the size of `session_id`: 8 bytes per PDU over a ~900 byte payload is
+//! 0.9%. Trimming it to u32 would save 0.4% in exchange for maintaining two
+//! distinct identifiers — the full one in the session, the truncated one on the
+//! wire. This design saves bytes when it is free (the ChaCha20 nonce is derived
+//! and never transmitted) but not when it costs clarity.
 
 use core::fmt;
 
-/// Versión del protocolo que este binario habla.
+/// Protocol version this binary speaks.
 pub const PROTOCOL_VERSION: u8 = 1;
 
-/// Bytes de cabecera que preceden al payload.
+/// Header bytes preceding the payload.
 pub const HEADER_LEN: usize = 22;
-/// Bytes de CRC que siguen al payload.
+/// CRC bytes following the payload.
 pub const TRAILER_LEN: usize = 4;
-/// Coste fijo de encapsular un payload.
+/// Fixed cost of framing a payload.
 pub const OVERHEAD: usize = HEADER_LEN + TRAILER_LEN;
 
-/// Máximo que el campo `payload_len` puede expresar.
+/// The largest value the `payload_len` field can express.
 ///
-/// El límite real de cada enlace es mucho menor y lo impone la MTU del canal
-/// (un QR ronda los 2 KB). El formato de wire no sabe nada de QR a propósito:
-/// esa es justo la separación que permite añadir el canal acústico sin tocar
-/// esta capa.
+/// The real per-link limit is far smaller and comes from the channel MTU (a QR
+/// code tops out around 2 KB). The wire format deliberately knows nothing about
+/// QR codes: that separation is exactly what lets the acoustic channel be added
+/// without touching this layer.
 pub const MAX_PAYLOAD: usize = u16::MAX as usize;
 
-/// Qué es cada PDU. Un byte, valores explícitos porque viajan por el cable.
+/// What a PDU is. One byte, with explicit values because they travel the wire.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[repr(u8)]
 pub enum PduKind {
-    /// Anuncio de presencia, portador del `peer_id` para elegir líder.
+    /// Presence announcement, carrying the `peer_id` used to elect a leader.
     Hello = 1,
-    /// Capacidades y perfiles ofrecidos.
+    /// Capabilities and offered profiles.
     Capabilities = 2,
-    /// Datos de la transferencia.
+    /// Transfer data.
     Data = 3,
-    /// Confirmación (acumulativa o selectiva, según `flags`).
+    /// Acknowledgement, cumulative or selective depending on `flags`.
     Ack = 4,
-    /// Sonda de calibración con patrón conocido.
+    /// Calibration probe carrying a known pattern.
     Probe = 5,
-    /// Métricas medidas sobre una sonda.
+    /// Metrics measured over a probe.
     ProbeResult = 6,
-    /// La transferencia terminó y se verificó.
+    /// The transfer finished and verified.
     Complete = 7,
-    /// Aborto explícito.
+    /// Explicit abort.
     Cancel = 8,
 }
 
@@ -84,24 +84,24 @@ impl PduKind {
     }
 }
 
-/// Bits de control. Newtype en vez de `bitflags` para no añadir dependencia
-/// por seis constantes.
+/// Control bits. A newtype rather than the `bitflags` crate, to avoid taking a
+/// dependency for six constants.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Hash)]
 pub struct Flags(pub u16);
 
 impl Flags {
     pub const NONE: Self = Self(0);
-    /// Abre la sesión.
+    /// Opens the session.
     pub const SYN: Self = Self(1 << 0);
-    /// Cierra la sesión.
+    /// Closes the session.
     pub const FIN: Self = Self(1 << 1);
-    /// El campo `ack` lleva información válida.
+    /// The `ack` field carries meaningful data.
     pub const ACK_VALID: Self = Self(1 << 2);
-    /// El payload va cifrado con la clave de sesión.
+    /// The payload is encrypted with the session key.
     pub const ENCRYPTED: Self = Self(1 << 3);
-    /// El payload es un símbolo de fuente (RaptorQ), no un chunk ordenado.
+    /// The payload is a fountain-coded symbol, not an ordered chunk.
     pub const FOUNTAIN: Self = Self(1 << 4);
-    /// Réplica de un PDU crítico enviado también por el otro canal.
+    /// A copy of a critical PDU also sent over the other channel.
     pub const DUPLICATED: Self = Self(1 << 5);
 
     #[must_use]
@@ -122,7 +122,7 @@ impl core::ops::BitOr for Flags {
     }
 }
 
-/// Una unidad de protocolo, ya decodificada.
+/// A decoded protocol data unit.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Pdu {
     pub session_id: u64,
@@ -133,42 +133,42 @@ pub struct Pdu {
     pub payload: Vec<u8>,
 }
 
-/// Por qué un buffer no es una PDU válida.
+/// Why a buffer is not a valid PDU.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum WireError {
-    #[error("buffer de {got} B, se necesitan al menos {need}")]
+    #[error("buffer of {got} B, at least {need} needed")]
     TooShort { got: usize, need: usize },
 
-    #[error("versión de protocolo {got}, este binario habla la {expected}")]
+    #[error("protocol version {got}, this binary speaks {expected}")]
     Version { got: u8, expected: u8 },
 
-    #[error("tipo de PDU desconocido: {0}")]
+    #[error("unknown PDU kind: {0}")]
     UnknownKind(u8),
 
-    #[error("declara {declared} B de payload pero el buffer solo trae {available}")]
+    #[error("declares {declared} B of payload but the buffer only holds {available}")]
     PayloadLen { declared: usize, available: usize },
 
-    #[error("sobran {0} B tras el CRC")]
+    #[error("{0} B left over after the CRC")]
     TrailingBytes(usize),
 
-    #[error("CRC no coincide: calculado {computed:08x}, recibido {received:08x}")]
+    #[error("CRC mismatch: computed {computed:08x}, received {received:08x}")]
     Crc { computed: u32, received: u32 },
 
-    #[error("payload de {got} B, el máximo del formato es {max}")]
+    #[error("payload of {got} B, the format maximum is {max}")]
     PayloadTooLarge { got: usize, max: usize },
 }
 
 impl Pdu {
-    /// Cuántos bytes ocupa esta PDU codificada.
+    /// How many bytes this PDU occupies once encoded.
     #[must_use]
     pub fn encoded_len(&self) -> usize {
         OVERHEAD + self.payload.len()
     }
 
-    /// Serializa al final de `out`.
+    /// Serializes onto the end of `out`.
     ///
-    /// Falla solo si el payload no cabe en el campo de longitud; todo lo demás
-    /// es infalible por construcción.
+    /// Only fails if the payload does not fit the length field; everything else
+    /// is infallible by construction.
     pub fn encode(&self, out: &mut Vec<u8>) -> Result<(), WireError> {
         if self.payload.len() > MAX_PAYLOAD {
             return Err(WireError::PayloadTooLarge {
@@ -194,19 +194,19 @@ impl Pdu {
         Ok(())
     }
 
-    /// Serializa a un `Vec` nuevo. Conveniencia para tests y para quien no
-    /// esté reutilizando buffer.
+    /// Serializes into a fresh `Vec`. Convenience for tests and for callers that
+    /// are not reusing a buffer.
     pub fn to_vec(&self) -> Result<Vec<u8>, WireError> {
         let mut out = Vec::with_capacity(self.encoded_len());
         self.encode(&mut out)?;
         Ok(out)
     }
 
-    /// Interpreta `buf` como exactamente una PDU.
+    /// Interprets `buf` as exactly one PDU.
     ///
-    /// Es estricto con los bytes sobrantes: un canal de marcos (un QR entrega
-    /// exactamente los bytes que se codificaron) no tiene por qué producirlos,
-    /// así que su presencia indica corrupción, no relleno.
+    /// Strict about leftover bytes: a framed channel — a QR code hands back
+    /// exactly the bytes that were encoded — has no reason to produce them, so
+    /// their presence signals corruption rather than padding.
     pub fn decode(buf: &[u8]) -> Result<Self, WireError> {
         if buf.len() < OVERHEAD {
             return Err(WireError::TooShort {
@@ -237,8 +237,8 @@ impl Pdu {
             return Err(WireError::TrailingBytes(buf.len() - total));
         }
 
-        // El CRC se comprueba antes de confiar en cualquier campo salvo los
-        // mínimos para saber dónde termina la PDU.
+        // The CRC is verified before trusting any field beyond the minimum
+        // needed to know where the PDU ends.
         let crc_at = HEADER_LEN + payload_len;
         let received = u32::from_le_bytes([
             buf[crc_at],

@@ -1,30 +1,32 @@
-//! FASE 0 — SPIKE DESECHABLE. Se borra entero al terminar la medición.
+//! PHASE 0 — THROWAWAY SPIKE. Deleted in full once the measurement is done.
 //!
-//! El panel izquierdo genera el QR y el derecho muestra la cámara.
+//! The left pane generates the QR code and the right pane shows the camera.
 //!
-//! Para que la cámara vea el QR hace falta una de estas (la webcam integrada de
-//! un portátil apunta al usuario y NO puede ver su propia pantalla):
-//!   - un segundo monitor con esta ventana, y el portátil mirándolo;
-//!   - una webcam USB apuntada a la pantalla;
-//!   - la segunda máquina, si ya la tienes delante.
+//! For the camera to see the code you need one of these (a laptop's built-in
+//! webcam faces the user and CANNOT see its own screen):
+//!   - a second monitor showing this window, with the laptop looking at it;
+//!   - a USB webcam aimed at the display;
+//!   - the second machine, if it is already in front of you;
+//!   - a phone running the mobile build, which is often the easiest option.
 //!
-//! Sin ningún QR delante los tramos de captura e IPC siguen siendo válidos —
-//! son los que deciden el go/no-go— pero el tramo de decode queda algo
-//! optimista: `rqrr` corre la detección completa igual, pero se salta la
-//! decodificación al no encontrar rejilla. Interpretar con esa reserva.
+//! With no QR code in view the capture and IPC segments remain valid — they are
+//! what decides the go/no-go — but the decode segment reads optimistically:
+//! `rqrr` still runs full detection, but skips decoding when it finds no grid.
+//! Read it with that caveat.
 //!
-//! El lazo se cronometra en tres tramos separados a propósito, porque no basta
-//! con saber SI falla el objetivo de ≥10 decodificaciones/s: hay que saber cuál
-//! de los tres repliegues del diseño aplica, y cada tramo señala uno distinto.
+//! The loop is timed in three separate segments on purpose, because knowing
+//! WHETHER the 10 decodes-per-second target fails is not enough: you need to
+//! know which of the three fallbacks applies, and each segment points at a
+//! different one.
 //!
-//! | Tramo dominante | Qué significa | Repliegue |
+//! | Dominant segment | What it means | Fallback |
 //! |---|---|---|
-//! | Captura  | el readback GPU→CPU de `getImageData` manda | bajar resolución u `OffscreenCanvas`; mover el decode a WASM NO ayuda |
-//! | IPC      | cruzar el puente cuesta más que decodificar | (b) decode en WASM: elimina el cruce entero |
-//! | Decode   | `rqrr` es el cuello | (a) recorte a ROI tras el primer lock; WASM tampoco ayuda |
+//! | Capture | the GPU-to-CPU readback of `getImageData` dominates | lower the resolution or use `OffscreenCanvas`; moving decode to WASM does NOT help |
+//! | IPC     | crossing the bridge costs more than decoding | (b) decode in WASM: it removes the crossing entirely |
+//! | Decode  | `rqrr` is the bottleneck | (a) crop to the region of interest after first lock; WASM does not help either |
 //!
-//! Sin esta separación el spike diría "no pasa" sin decir qué hacer, que es
-//! justo lo que un spike no debe hacer.
+//! Without that separation the spike would say "it fails" without saying what to
+//! do, which is precisely what a spike must not do.
 
 use js_sys::{Object, Reflect, Uint8Array};
 use leptos::prelude::*;
@@ -48,16 +50,16 @@ struct DecodeReport {
     content: Option<String>,
 }
 
-/// Qué ruta de IPC se está midiendo.
+/// Which IPC path is being measured.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum Path {
-    /// Bytes crudos: el typed array es el argumento completo del invoke.
+    /// Raw bytes: the typed array is the entire invoke argument.
     Raw,
-    /// Control: los bytes cruzan como números en un array JSON.
+    /// Control: the bytes cross as numbers in a JSON array.
     Json,
 }
 
-/// Media móvil sobre las últimas muestras, para que los números no bailen.
+/// Rolling mean over the last few samples, so the numbers do not jitter.
 #[derive(Clone, Default)]
 struct Rolling {
     samples: Vec<f64>,
@@ -85,8 +87,8 @@ fn now_ms() -> f64 {
     window().performance().map(|p| p.now()).unwrap_or(0.0)
 }
 
-/// Convierte el RGBA que devuelve `getImageData` a luma de 8 bits, con la
-/// cabecera de 8 B (ancho, alto en u32 LE) que espera el backend.
+/// Converts the RGBA that `getImageData` returns into 8-bit luma, with the 8 B
+/// header (width, height as little-endian u32) the backend expects.
 fn rgba_to_grey_with_header(rgba: &[u8], width: u32, height: u32) -> Vec<u8> {
     let px = (width as usize) * (height as usize);
     let mut out = Vec::with_capacity(8 + px);
@@ -120,9 +122,9 @@ pub fn Spike() -> impl IntoView {
     let (decode_ms, set_decode_ms) = signal(0.0f64);
     let (bytes, set_bytes) = signal(0usize);
     let (hit_rate, set_hit_rate) = signal(0.0f64);
-    let (status, set_status) = signal(String::from("detenido"));
+    let (status, set_status) = signal(String::from("stopped"));
 
-    // El QR en pantalla se regenera despacio: solo sirve de blanco para la cámara.
+    // The on-screen QR regenerates slowly: it is only a target for the camera.
     Effect::new(move |_| {
         let c = counter.get();
         spawn_local(async move {
@@ -142,17 +144,17 @@ pub fn Spike() -> impl IntoView {
             return;
         }
         set_running.set(true);
-        set_status.set("abriendo cámara…".into());
+        set_status.set("opening camera...".into());
 
         spawn_local(async move {
             let w = width.get_untracked();
             let h = height.get_untracked();
 
-            // --- abrir la webcam ---------------------------------------------
+            // --- open the webcam ---------------------------------------------
             let devices = match window().navigator().media_devices() {
                 Ok(d) => d,
                 Err(e) => {
-                    set_status.set(format!("sin mediaDevices: {e:?}"));
+                    set_status.set(format!("no mediaDevices: {e:?}"));
                     set_running.set(false);
                     return;
                 }
@@ -161,6 +163,9 @@ pub fn Spike() -> impl IntoView {
             let video_cfg = Object::new();
             let _ = Reflect::set(&video_cfg, &"width".into(), &JsValue::from(w));
             let _ = Reflect::set(&video_cfg, &"height".into(), &JsValue::from(h));
+            // Rear camera when there is one: on a phone it is far better than the
+            // front camera, and it is the one that will be pointed at the peer.
+            let _ = Reflect::set(&video_cfg, &"facingMode".into(), &"environment".into());
             let constraints = Object::new();
             let _ = Reflect::set(&constraints, &"video".into(), &video_cfg.into());
             let _ = Reflect::set(&constraints, &"audio".into(), &JsValue::FALSE);
@@ -169,7 +174,7 @@ pub fn Spike() -> impl IntoView {
             let promise = match devices.get_user_media_with_constraints(&constraints) {
                 Ok(p) => p,
                 Err(e) => {
-                    set_status.set(format!("getUserMedia rechazó: {e:?}"));
+                    set_status.set(format!("getUserMedia refused: {e:?}"));
                     set_running.set(false);
                     return;
                 }
@@ -177,7 +182,7 @@ pub fn Spike() -> impl IntoView {
             let stream = match JsFuture::from(promise).await {
                 Ok(s) => s,
                 Err(e) => {
-                    set_status.set(format!("sin permiso de cámara: {e:?}"));
+                    set_status.set(format!("no camera permission: {e:?}"));
                     set_running.set(false);
                     return;
                 }
@@ -185,16 +190,16 @@ pub fn Spike() -> impl IntoView {
             let stream: web_sys::MediaStream = stream.unchecked_into();
 
             let Some(video) = video_ref.get_untracked() else {
-                set_status.set("falta el elemento <video>".into());
+                set_status.set("the <video> element is missing".into());
                 set_running.set(false);
                 return;
             };
             video.set_src_object(Some(&stream));
             let _ = video.play();
 
-            set_status.set("midiendo…".into());
+            set_status.set("measuring...".into());
 
-            // --- lazo de captura ---------------------------------------------
+            // --- capture loop -------------------------------------------------
             let mut r_fps = Rolling::default();
             let mut r_cap = Rolling::default();
             let mut r_ipc = Rolling::default();
@@ -220,7 +225,7 @@ pub fn Spike() -> impl IntoView {
                     .flatten()
                     .and_then(|c| c.dyn_into::<web_sys::CanvasRenderingContext2d>().ok());
                 let Some(ctx) = ctx else {
-                    set_status.set("sin contexto 2d".into());
+                    set_status.set("no 2d context".into());
                     break;
                 };
 
@@ -243,14 +248,15 @@ pub fn Spike() -> impl IntoView {
                 let grey = rgba_to_grey_with_header(&rgba, w, h);
                 r_cap.push(now_ms() - t_capture);
 
-                // --- el invoke que estamos midiendo --------------------------
+                // --- the invoke being measured -------------------------------
                 let t_ipc = now_ms();
                 let report: Option<DecodeReport> = match path.get_untracked() {
                     Path::Raw => {
-                        // El typed array va SOLO, sin envolver: es lo que dispara
-                        // la ruta binaria en process-ipc-message-fn.js. Anidarlo
-                        // en un objeto lo mandaría por JSON.stringify, que es
-                        // justo el caso patológico que la otra rama mide.
+                        // The typed array goes ALONE, unwrapped: that is what
+                        // triggers the binary path in
+                        // process-ipc-message-fn.js. Nesting it in an object
+                        // would send it through JSON.stringify, which is exactly
+                        // the pathological case the other branch measures.
                         let buf = Uint8Array::new_with_length(grey.len() as u32);
                         buf.copy_from(&grey);
                         let res = invoke("spike_decode_raw", buf.into()).await;
@@ -275,10 +281,11 @@ pub fn Spike() -> impl IntoView {
                 if let Some(rep) = report {
                     let dec = rep.decode_us / 1000.0;
                     r_dec.push(dec);
-                    // El coste atribuible al IPC es el reloj de pared del invoke
-                    // menos lo que el backend declara haber gastado decodificando.
-                    // La captura queda fuera a proposito: se mide aparte porque es
-                    // lo que decide QUE repliegue tomar si el spike no pasa.
+                    // The cost attributable to IPC is the invoke's wall clock
+                    // minus what the backend reports having spent decoding.
+                    // Capture is deliberately excluded and measured separately,
+                    // because it is what decides WHICH fallback to take if the
+                    // spike does not pass.
                     r_ipc.push((elapsed_ipc - dec).max(0.0));
                     set_bytes.set(rep.bytes_in);
                     if rep.grids > 0 {
@@ -286,7 +293,7 @@ pub fn Spike() -> impl IntoView {
                     }
                     if let Some(c) = rep.content {
                         let head: String = c.chars().take(16).collect();
-                        set_status.set(format!("leído: {head}"));
+                        set_status.set(format!("read: {head}"));
                     }
                 }
 
@@ -311,11 +318,11 @@ pub fn Spike() -> impl IntoView {
                     set_counter.update(|c| *c += 1);
                 }
 
-                // Cede al event loop para que el preview siga fluido.
+                // Yield to the event loop so the preview stays smooth.
                 gloo_timers::future::TimeoutFuture::new(0).await;
             }
 
-            set_status.set("detenido".into());
+            set_status.set("stopped".into());
         });
     };
 
@@ -323,10 +330,11 @@ pub fn Spike() -> impl IntoView {
 
     view! {
         <main class="spike">
-            <h1>"Fase 0 — spike de throughput IPC"</h1>
+            <h1>"Phase 0 - IPC throughput spike"</h1>
             <p class="hint">
-                "Encuadra el QR de la izquierda con la cámara: segundo monitor, webcam USB, "
-                "o la otra máquina. La webcam integrada no puede ver su propia pantalla."
+                "Frame the QR code on the left with the camera: a second monitor, a USB "
+                "webcam, a phone, or the other machine. A built-in webcam cannot see its "
+                "own screen."
             </p>
 
             <div class="panes">
@@ -339,8 +347,8 @@ pub fn Spike() -> impl IntoView {
             <canvas node_ref=canvas_ref style="display:none"></canvas>
 
             <div class="controls">
-                <button on:click=start disabled=move || running.get()>"Iniciar"</button>
-                <button on:click=stop disabled=move || !running.get()>"Parar"</button>
+                <button on:click=start disabled=move || running.get()>"Start"</button>
+                <button on:click=stop disabled=move || !running.get()>"Stop"</button>
 
                 <select on:change=move |ev| {
                     let (w, h) = match event_target_value(&ev).as_str() {
@@ -351,9 +359,9 @@ pub fn Spike() -> impl IntoView {
                     set_width.set(w);
                     set_height.set(h);
                 }>
-                    <option value="1280x720">"1280 × 720"</option>
-                    <option value="960x540">"960 × 540"</option>
-                    <option value="640x480">"640 × 480"</option>
+                    <option value="1280x720">"1280 x 720"</option>
+                    <option value="960x540">"960 x 540"</option>
+                    <option value="640x480">"640 x 480"</option>
                 </select>
 
                 <select on:change=move |ev| {
@@ -363,22 +371,22 @@ pub fn Spike() -> impl IntoView {
                             _ => Path::Raw,
                         });
                 }>
-                    <option value="raw">"IPC binario crudo"</option>
-                    <option value="json">"IPC por array JSON (control)"</option>
+                    <option value="raw">"Raw binary IPC"</option>
+                    <option value="json">"JSON array IPC (control)"</option>
                 </select>
             </div>
 
             <table class="metrics">
                 <tr>
-                    <td>"Decodificaciones/s"</td>
+                    <td>"Decodes/s"</td>
                     <td>{move || format!("{:.1}", fps.get())}</td>
                 </tr>
                 <tr>
-                    <td>"Captura (drawImage + getImageData + luma)"</td>
+                    <td>"Capture (drawImage + getImageData + luma)"</td>
                     <td>{move || format!("{:.1} ms", capture_ms.get())}</td>
                 </tr>
                 <tr>
-                    <td>"IPC (ida y vuelta, sin decode)"</td>
+                    <td>"IPC (round trip, decode excluded)"</td>
                     <td>{move || format!("{:.1} ms", ipc_ms.get())}</td>
                 </tr>
                 <tr>
@@ -386,15 +394,15 @@ pub fn Spike() -> impl IntoView {
                     <td>{move || format!("{:.1} ms", decode_ms.get())}</td>
                 </tr>
                 <tr>
-                    <td>"Bytes por frame"</td>
+                    <td>"Bytes per frame"</td>
                     <td>{move || format!("{}", bytes.get())}</td>
                 </tr>
                 <tr>
-                    <td>"Frames con QR"</td>
+                    <td>"Frames with a QR"</td>
                     <td>{move || format!("{:.0} %", hit_rate.get())}</td>
                 </tr>
                 <tr>
-                    <td>"Estado"</td>
+                    <td>"Status"</td>
                     <td>{move || status.get()}</td>
                 </tr>
             </table>

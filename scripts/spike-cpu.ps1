@@ -1,13 +1,13 @@
-# FASE 0 — medición de CPU del spike. Se borra con el spike.
+# PHASE 0 - CPU measurement for the spike. Deleted along with the spike.
 #
-# La app no puede medir su propio consumo de forma honesta: el criterio del
-# diseño es "<30% de un core", y eso hay que verlo desde fuera.
+# The app cannot honestly measure its own consumption: the design's criterion is
+# "under 30% of one core", and that has to be seen from outside.
 #
-# Uso:  pwsh -File scripts/spike-cpu.ps1 -Seconds 30
+# Usage:  pwsh -File scripts/spike-cpu.ps1 -Seconds 30
 #
-# Muestrea el tiempo de CPU del proceso de la app y lo normaliza a "porcentaje
-# de un core", que es la unidad en la que está escrito el criterio. En una
-# máquina de N cores, el Task Manager mostraría este número dividido por N.
+# Samples the app process's CPU time and normalises it to "percentage of one
+# core", which is the unit the criterion is written in. On an N-core machine,
+# Task Manager would show this number divided by N.
 
 param(
     [int]$Seconds = 30,
@@ -16,17 +16,17 @@ param(
 
 $procs = Get-Process -Name $ProcessName -ErrorAction SilentlyContinue
 if (-not $procs) {
-    Write-Error "No hay ningún proceso '$ProcessName'. Arranca el spike con 'cargo tauri dev' primero."
+    Write-Error "No process named '$ProcessName'. Start the spike with 'cargo tauri dev' first."
     exit 1
 }
 
-Write-Output "Muestreando $($procs.Count) proceso(s) '$ProcessName' durante $Seconds s…"
-Write-Output "Pon el spike a medir ANTES de que termine la cuenta."
+Write-Output "Sampling $($procs.Count) '$ProcessName' process(es) for $Seconds s..."
+Write-Output "Get the spike measuring BEFORE the countdown ends."
 Write-Output ""
 
-# El WebView corre en procesos hijos separados (msedgewebview2). El coste de
-# getImageData y del canvas vive ahí, no en el proceso Rust: contar solo el
-# padre subestimaría el consumo real de la ruta híbrida.
+# The WebView runs in separate child processes (msedgewebview2). The cost of
+# getImageData and the canvas lives there, not in the Rust process: counting only
+# the parent would understate the hybrid path's real consumption.
 $names = @($ProcessName, "msedgewebview2")
 
 function Get-CpuSnapshot {
@@ -51,14 +51,14 @@ $percentOfOneCore = ($cpuSeconds / $wallSeconds) * 100.0
 $cores = [Environment]::ProcessorCount
 
 Write-Output ""
-Write-Output "Ventana de muestreo : $([math]::Round($wallSeconds,1)) s"
-Write-Output "CPU consumida       : $([math]::Round($cpuSeconds,2)) s"
-Write-Output "Porcentaje de 1 core: $([math]::Round($percentOfOneCore,1)) %   <-- criterio: <30 %"
-Write-Output "Porcentaje total    : $([math]::Round($percentOfOneCore/$cores,1)) %  (de $cores cores)"
+Write-Output "Sampling window   : $([math]::Round($wallSeconds,1)) s"
+Write-Output "CPU consumed      : $([math]::Round($cpuSeconds,2)) s"
+Write-Output "Percent of 1 core : $([math]::Round($percentOfOneCore,1)) %   <-- criterion: under 30 %"
+Write-Output "Percent of total  : $([math]::Round($percentOfOneCore/$cores,1)) %  (of $cores cores)"
 Write-Output ""
 
 if ($percentOfOneCore -lt 30.0) {
-    Write-Output "PASA el criterio de CPU."
+    Write-Output "PASSES the CPU criterion."
 } else {
-    Write-Output "NO pasa el criterio de CPU. Repliegues en orden: recorte a ROI, decode en WASM, nokhwa nativo."
+    Write-Output "FAILS the CPU criterion. Fallbacks in order: crop to ROI, decode in WASM, native nokhwa."
 }

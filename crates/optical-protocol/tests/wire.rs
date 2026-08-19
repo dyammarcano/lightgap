@@ -1,9 +1,9 @@
-//! Tests del formato de wire.
+//! Wire format tests.
 //!
-//! El canal óptico entrega marcos corruptos con regularidad —desenfoque,
-//! reflejos, movimiento— así que lo que se prueba aquí no es solo que el
-//! roundtrip funcione, sino que la corrupción **se detecte siempre**. Un byte
-//! malo que pase por bueno se convierte en un archivo corrupto al otro lado.
+//! The optical channel delivers corrupt frames routinely — blur, reflections,
+//! motion — so what is asserted here is not merely that the round trip works,
+//! but that corruption is **always detected**. One bad byte passing for good
+//! becomes a corrupt file on the other side.
 
 use optical_protocol::wire::{
     Flags, Pdu, PduKind, WireError, HEADER_LEN, MAX_PAYLOAD, OVERHEAD, PROTOCOL_VERSION,
@@ -17,26 +17,26 @@ fn sample() -> Pdu {
         flags: Flags::ACK_VALID | Flags::FOUNTAIN,
         seq: 42,
         ack: 41,
-        payload: b"carga de prueba".to_vec(),
+        payload: b"test payload".to_vec(),
     }
 }
 
 #[test]
-fn roundtrip_conserva_todos_los_campos() {
+fn round_trip_preserves_every_field() {
     let pdu = sample();
-    let bytes = pdu.to_vec().expect("codifica");
-    assert_eq!(Pdu::decode(&bytes).expect("decodifica"), pdu);
+    let bytes = pdu.to_vec().expect("encodes");
+    assert_eq!(Pdu::decode(&bytes).expect("decodes"), pdu);
 }
 
 #[test]
-fn encoded_len_coincide_con_lo_producido() {
+fn encoded_len_matches_what_is_produced() {
     let pdu = sample();
     assert_eq!(pdu.to_vec().unwrap().len(), pdu.encoded_len());
     assert_eq!(pdu.encoded_len(), OVERHEAD + pdu.payload.len());
 }
 
 #[test]
-fn payload_vacio_es_valido() {
+fn an_empty_payload_is_valid() {
     let pdu = Pdu {
         payload: Vec::new(),
         ..sample()
@@ -47,7 +47,7 @@ fn payload_vacio_es_valido() {
 }
 
 #[test]
-fn buffer_corto_se_rechaza_sin_leer_campos() {
+fn a_short_buffer_is_rejected_without_reading_fields() {
     for n in 0..OVERHEAD {
         let buf = vec![0u8; n];
         assert_eq!(
@@ -56,13 +56,13 @@ fn buffer_corto_se_rechaza_sin_leer_campos() {
                 got: n,
                 need: OVERHEAD
             }),
-            "un buffer de {n} B debería rechazarse por corto"
+            "a {n} B buffer should be rejected as too short"
         );
     }
 }
 
 #[test]
-fn version_distinta_se_rechaza() {
+fn a_different_version_is_rejected() {
     let mut bytes = sample().to_vec().unwrap();
     bytes[0] = PROTOCOL_VERSION.wrapping_add(1);
     assert_eq!(
@@ -75,36 +75,36 @@ fn version_distinta_se_rechaza() {
 }
 
 #[test]
-fn tipo_desconocido_se_rechaza() {
+fn an_unknown_kind_is_rejected() {
     let mut bytes = sample().to_vec().unwrap();
     bytes[9] = 0xff;
     assert_eq!(Pdu::decode(&bytes), Err(WireError::UnknownKind(0xff)));
 }
 
 #[test]
-fn longitud_declarada_mayor_que_el_buffer_se_rechaza() {
+fn a_declared_length_beyond_the_buffer_is_rejected() {
     let pdu = sample();
     let mut bytes = pdu.to_vec().unwrap();
-    let inflada = (pdu.payload.len() as u16) + 10;
-    bytes[20..22].copy_from_slice(&inflada.to_le_bytes());
+    let inflated = (pdu.payload.len() as u16) + 10;
+    bytes[20..22].copy_from_slice(&inflated.to_le_bytes());
     assert_eq!(
         Pdu::decode(&bytes),
         Err(WireError::PayloadLen {
-            declared: inflada as usize,
+            declared: inflated as usize,
             available: bytes.len() - OVERHEAD,
         })
     );
 }
 
 #[test]
-fn bytes_sobrantes_se_rechazan() {
+fn trailing_bytes_are_rejected() {
     let mut bytes = sample().to_vec().unwrap();
     bytes.extend_from_slice(&[0, 0, 0]);
     assert_eq!(Pdu::decode(&bytes), Err(WireError::TrailingBytes(3)));
 }
 
 #[test]
-fn payload_mayor_que_el_campo_de_longitud_no_se_codifica() {
+fn a_payload_beyond_the_length_field_does_not_encode() {
     let pdu = Pdu {
         payload: vec![0u8; MAX_PAYLOAD + 1],
         ..sample()
@@ -118,54 +118,54 @@ fn payload_mayor_que_el_campo_de_longitud_no_se_codifica() {
     );
 }
 
-/// La propiedad que de verdad importa en este dominio.
+/// The property that genuinely matters in this domain.
 ///
-/// CRC32 detecta todo error de un solo bit, pero la PDU tiene campos
-/// estructurales (versión, tipo, longitud) que se leen ANTES de comprobar el
-/// CRC. Este test recorre exhaustivamente cada bit de un marco codificado y
-/// exige que voltearlo produzca un error — sea del CRC o estructural. Es la
-/// garantía de que ningún marco corrupto se acepta como bueno.
+/// CRC32 detects every single-bit error, but the PDU has structural fields
+/// (version, kind, length) that are read *before* the CRC is checked. This test
+/// walks every bit of an encoded frame exhaustively and demands that flipping it
+/// produces an error — whether from the CRC or from structure. It is the
+/// guarantee that no corrupt frame is ever accepted as good.
 #[test]
-fn ningun_bit_volteado_pasa_por_bueno() {
+fn no_flipped_bit_passes_for_good() {
     let pdu = sample();
-    let limpio = pdu.to_vec().unwrap();
+    let clean = pdu.to_vec().unwrap();
 
-    for byte_idx in 0..limpio.len() {
+    for byte_idx in 0..clean.len() {
         for bit in 0..8 {
-            let mut corrupto = limpio.clone();
-            corrupto[byte_idx] ^= 1 << bit;
+            let mut corrupt = clean.clone();
+            corrupt[byte_idx] ^= 1 << bit;
 
-            match Pdu::decode(&corrupto) {
+            match Pdu::decode(&corrupt) {
                 Err(_) => {}
-                Ok(recuperado) => panic!(
-                    "el bit {bit} del byte {byte_idx} se volteó y decode() lo aceptó: {recuperado}"
+                Ok(recovered) => panic!(
+                    "bit {bit} of byte {byte_idx} was flipped and decode() accepted it: {recovered}"
                 ),
             }
         }
     }
 }
 
-/// Voltear dos bits tampoco debería colar. CRC32 no lo garantiza en general
-/// para cualquier distancia, pero sí para errores dentro de su alcance; este
-/// test acota empíricamente el riesgo sobre un marco representativo.
+/// Flipping two bits should not slip through either. CRC32 does not guarantee
+/// this for arbitrary distances in general, but it does within its span; this
+/// test empirically bounds the risk over a representative frame.
 #[test]
-fn ningun_par_de_bits_volteados_pasa_por_bueno() {
+fn no_pair_of_flipped_bits_passes_for_good() {
     let pdu = Pdu {
         payload: b"abcd".to_vec(),
         ..sample()
     };
-    let limpio = pdu.to_vec().unwrap();
-    let total_bits = limpio.len() * 8;
+    let clean = pdu.to_vec().unwrap();
+    let total_bits = clean.len() * 8;
 
     for a in 0..total_bits {
         for b in (a + 1)..total_bits {
-            let mut corrupto = limpio.clone();
-            corrupto[a / 8] ^= 1 << (a % 8);
-            corrupto[b / 8] ^= 1 << (b % 8);
+            let mut corrupt = clean.clone();
+            corrupt[a / 8] ^= 1 << (a % 8);
+            corrupt[b / 8] ^= 1 << (b % 8);
 
             assert!(
-                Pdu::decode(&corrupto).is_err(),
-                "los bits {a} y {b} volteados juntos pasaron por buenos"
+                Pdu::decode(&corrupt).is_err(),
+                "bits {a} and {b} flipped together passed for good"
             );
         }
     }
@@ -198,29 +198,29 @@ prop_compose! {
 }
 
 proptest! {
-    /// Cualquier PDU representable sobrevive al viaje de ida y vuelta.
+    /// Any representable PDU survives the round trip.
     #[test]
-    fn roundtrip_arbitrario(pdu in pdu_arb()) {
+    fn arbitrary_round_trip(pdu in pdu_arb()) {
         let bytes = pdu.to_vec().unwrap();
         prop_assert_eq!(bytes.len(), pdu.encoded_len());
         prop_assert_eq!(Pdu::decode(&bytes).unwrap(), pdu);
     }
 
-    /// Truncar por cualquier sitio se detecta. Un marco óptico parcialmente
-    /// leído es un caso real, no hipotético.
+    /// Truncation anywhere is detected. A partially read optical frame is a real
+    /// case, not a hypothetical one.
     #[test]
-    fn truncar_siempre_se_detecta(pdu in pdu_arb(), corte in 0usize..4096) {
+    fn truncation_is_always_detected(pdu in pdu_arb(), cut in 0usize..4096) {
         let bytes = pdu.to_vec().unwrap();
-        let corte = corte % bytes.len().max(1);
-        prop_assert!(Pdu::decode(&bytes[..corte]).is_err());
+        let cut = cut % bytes.len().max(1);
+        prop_assert!(Pdu::decode(&bytes[..cut]).is_err());
     }
 
-    /// El payload empieza exactamente donde dice la cabecera. Protege contra
-    /// que un cambio de layout desplace el payload sin que nadie se entere.
+    /// The payload starts exactly where the header says. Guards against a layout
+    /// change shifting the payload without anyone noticing.
     #[test]
-    fn el_payload_esta_donde_dice_la_cabecera(pdu in pdu_arb()) {
+    fn the_payload_sits_where_the_header_says(pdu in pdu_arb()) {
         let bytes = pdu.to_vec().unwrap();
-        let fin = HEADER_LEN + pdu.payload.len();
-        prop_assert_eq!(&bytes[HEADER_LEN..fin], &pdu.payload[..]);
+        let end = HEADER_LEN + pdu.payload.len();
+        prop_assert_eq!(&bytes[HEADER_LEN..end], &pdu.payload[..]);
     }
 }

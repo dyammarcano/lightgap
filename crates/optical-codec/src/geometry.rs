@@ -1,12 +1,12 @@
-//! Cómo está encuadrado el código dentro del frame.
+//! How the code sits inside the frame.
 //!
-//! Es lo que alimenta la ayuda de alineamiento de la interfaz. La medida que
-//! más manda es `pixels_per_module`: por debajo de unos 6 píxeles por módulo
-//! —valor medido, ver [`MIN_PIXELS_PER_MODULE`]— el detector empieza a fallar
-//! por muy bien centrado que esté el código, y ningún otro ajuste lo compensa.
-//! Por eso «acércate» es casi siempre el consejo correcto cuando algo va mal.
+//! This feeds the alignment guidance in the UI. The measure that dominates is
+//! `pixels_per_module`: below about six pixels per module — a measured figure,
+//! see [`MIN_PIXELS_PER_MODULE`] — the detector starts failing no matter how
+//! well centred the code is, and no other adjustment compensates. That is why
+//! "move closer" is almost always the right advice when something is wrong.
 
-/// Un punto en coordenadas del frame.
+/// A point in frame coordinates.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Point {
     pub x: f32,
@@ -21,50 +21,49 @@ impl Point {
     }
 }
 
-/// Dónde y cómo se ve el código.
+/// Where and how the code is seen.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct QrGeometry {
-    /// Esquinas en orden: superior izquierda, superior derecha, inferior
-    /// derecha, inferior izquierda.
+    /// Corners in order: top-left, top-right, bottom-right, bottom-left.
     pub corners: [Point; 4],
-    /// Lado medio en píxeles.
+    /// Mean side length in pixels.
     pub side_px: f32,
-    /// Giro respecto a la horizontal, en grados, en −180..=180.
+    /// Rotation from horizontal, in degrees, within -180..=180.
     pub rotation_deg: f32,
-    /// Cuánto se aparta de un cuadrado, en 0..=1.
+    /// How far it departs from a square, in 0..=1.
     ///
-    /// Cero es un cuadrado perfecto; crece cuando el código se ve en escorzo
-    /// porque las pantallas no están enfrentadas.
+    /// Zero is a perfect square; it grows as the code is seen at an angle
+    /// because the displays are not facing each other squarely.
     pub perspective_error: f32,
-    /// Fracción del área del frame que ocupa el código, en 0..=1.
+    /// Fraction of the frame area the code occupies, in 0..=1.
     pub frame_coverage: f32,
-    /// Desplazamiento del centro respecto al centro del frame, en 0..=1, donde
-    /// 1 es una esquina.
+    /// Displacement of the centre from the frame centre, in 0..=1, where 1 is a
+    /// corner.
     pub offset: f32,
-    /// Módulos por lado del código detectado.
+    /// Modules per side of the detected code.
     pub modules: u32,
-    /// Píxeles de imagen por módulo. La medida que decide si se puede leer.
+    /// Image pixels per module. The measure that decides readability.
     pub pixels_per_module: f32,
 }
 
 impl QrGeometry {
-    /// Calcula la geometría a partir de las cuatro esquinas y el tamaño del
-    /// frame.
+    /// Computes geometry from the four corners and the frame size.
     #[must_use]
     pub fn from_corners(corners: [Point; 4], modules: u32, frame_w: u32, frame_h: u32) -> Self {
         let [tl, tr, br, bl] = corners;
 
-        let arriba = tl.dist(tr);
-        let derecha = tr.dist(br);
-        let abajo = br.dist(bl);
-        let izquierda = bl.dist(tl);
-        let side_px = (arriba + derecha + abajo + izquierda) / 4.0;
+        let top = tl.dist(tr);
+        let right = tr.dist(br);
+        let bottom = br.dist(bl);
+        let left = bl.dist(tl);
+        let side_px = (top + right + bottom + left) / 4.0;
 
-        // El escorzo se estima comparando lados opuestos: en un cuadrado visto
-        // de frente son iguales, y la diferencia relativa crece con el ángulo.
+        // Foreshortening is estimated by comparing opposite sides: in a square
+        // seen head-on they are equal, and the relative difference grows with
+        // the angle.
         let perspective_error = if side_px > 0.0 {
-            let h = (arriba - abajo).abs() / side_px;
-            let v = (izquierda - derecha).abs() / side_px;
+            let h = (top - bottom).abs() / side_px;
+            let v = (left - right).abs() / side_px;
             (h.max(v)).min(1.0)
         } else {
             1.0
@@ -108,88 +107,89 @@ impl QrGeometry {
     }
 }
 
-/// Píxeles por módulo a partir de los cuales la lectura es fiable.
+/// Pixels per module at which reading becomes reliable.
 ///
-/// **Medido, no supuesto.** Barriendo escalas fraccionarias sobre la cámara
-/// sintética (`cargo run -p optical-codec --example umbral`):
+/// **Measured, not assumed.** Sweeping fractional scales through the synthetic
+/// camera (`cargo run -p optical-codec --example threshold`):
 ///
-/// | px/módulo | tasa de lectura |
+/// | px/module | read rate |
 /// |---|---|
-/// | 2,0–3,0 | 24–40 % |
-/// | 3,0–6,0 | 60–87 % |
-/// | ≥ 6,0   | ~100 %  |
+/// | 2.0-3.0 | 24-40% |
+/// | 3.0-6.0 | 60-87% |
+/// | 6.0+    | ~100%  |
 ///
-/// El estándar habla de 2 como mínimo absoluto, pero ese número supone una
-/// rejilla alineada al píxel. Una cámara escala de forma fraccionaria, los
-/// bordes de módulo caen a mitad de píxel y el detector —que muestrea el centro
-/// del módulo— se despista. El doble del mínimo teórico es lo que cuesta la
-/// realidad.
+/// The standard quotes 2 as an absolute minimum, but that number assumes a grid
+/// aligned to the pixel. A camera scales fractionally, module edges land
+/// mid-pixel, and the detector — which samples the module centre — gets
+/// confused. Twice the theoretical minimum is what reality costs.
 ///
-/// Consecuencia práctica: a 720p con el código ocupando el 70 % del alto caben
-/// unos 84 módulos, es decir alrededor de 450 B por marco con corrección Q.
+/// Practical consequence: at 720p with the code filling 70% of the height, about
+/// 84 modules fit, which is roughly 450 B per frame at correction level Q.
 pub const MIN_PIXELS_PER_MODULE: f32 = 6.0;
 
-/// Por debajo de esto la lectura falla más de la mitad de las veces.
+/// Below this, reading fails more often than it succeeds.
 ///
-/// Entre este valor y [`MIN_PIXELS_PER_MODULE`] el enlace funciona a ratos: sirve
-/// para no cortar la sesión a la primera, no para operar.
+/// Between this value and [`MIN_PIXELS_PER_MODULE`] the link works
+/// intermittently: useful for not cutting the session at the first stumble, not
+/// for operating.
 pub const MARGINAL_PIXELS_PER_MODULE: f32 = 3.0;
 
-/// Por encima de esta cobertura el código roza los bordes del frame y se corta
-/// al menor movimiento.
+/// Above this coverage the code brushes the frame edges and gets clipped at the
+/// slightest movement.
 pub const MAX_COVERAGE: f32 = 0.75;
 
-/// Escorzo por encima del cual conviene enderezar las pantallas.
+/// Foreshortening beyond which the displays are worth straightening.
 pub const MAX_PERSPECTIVE_ERROR: f32 = 0.20;
 
-/// Desplazamiento del centro a partir del cual conviene recentrar.
+/// Centre displacement beyond which re-centring is worth suggesting.
 pub const MAX_OFFSET: f32 = 0.35;
 
-/// Varianza del laplaciano por debajo de la cual la imagen está desenfocada.
+/// Laplacian variance below which the image is out of focus.
 pub const MIN_SHARPNESS: f32 = 50.0;
 
-/// Qué decirle a quien sostiene los equipos.
+/// What to tell whoever is holding the devices.
 ///
-/// Un solo consejo cada vez, y el que más manda: una lista de cinco cosas a
-/// corregir a la vez no se sigue, y algunas se arreglan solas al corregir otra
-/// —acercarse suele mejorar el enfoque y la cobertura de paso.
+/// One piece of advice at a time, and the one that dominates: a list of five
+/// things to fix at once does not get followed, and some fix themselves when
+/// another is addressed — moving closer usually improves focus and coverage
+/// along the way.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Advice {
-    /// El enlace está en condiciones.
+    /// The link is in good shape.
     Ok,
-    /// Muy pocos píxeles por módulo.
+    /// Far too few pixels per module.
     MoveCloser,
-    /// El código llena el frame y se cortará al menor movimiento.
+    /// The code fills the frame and will clip at the slightest movement.
     MoveAway,
-    /// Descentrado.
+    /// Off centre.
     Center,
-    /// Demasiado escorzo: las pantallas no se miran de frente.
+    /// Too much foreshortening: the displays are not facing each other.
     Straighten,
-    /// La imagen está borrosa.
+    /// The image is blurry.
     Focus,
 }
 
 impl Advice {
-    /// Mensaje corto para la interfaz.
+    /// Short message for the UI.
     #[must_use]
     pub const fn message(self) -> &'static str {
         match self {
-            Self::Ok => "Enlace óptico estable",
-            Self::MoveCloser => "Acerque los equipos",
-            Self::MoveAway => "Separe los equipos",
-            Self::Center => "Centre el código en la cámara",
-            Self::Straighten => "Enfrente las pantallas",
-            Self::Focus => "Enfoque insuficiente",
+            Self::Ok => "Optical link stable",
+            Self::MoveCloser => "Move the devices closer",
+            Self::MoveAway => "Move the devices apart",
+            Self::Center => "Centre the code in the camera",
+            Self::Straighten => "Face the displays to each other",
+            Self::Focus => "Insufficient focus",
         }
     }
 }
 
-/// Elige el consejo más urgente.
+/// Picks the most urgent advice.
 ///
-/// El orden importa y no es arbitrario: sin píxeles suficientes por módulo nada
-/// más se puede arreglar, así que va primero. El enfoque va antes que el
-/// centrado porque una imagen borrosa hace que las esquinas —y con ellas todas
-/// las demás medidas— sean poco de fiar.
+/// The order matters and is not arbitrary: without enough pixels per module
+/// nothing else can be fixed, so it comes first. Focus comes before centring
+/// because a blurry image makes the corners — and therefore every other measure
+/// — untrustworthy.
 #[must_use]
 pub fn advise(geom: &QrGeometry, sharpness: f32) -> Advice {
     if geom.pixels_per_module < MIN_PIXELS_PER_MODULE {
@@ -210,12 +210,17 @@ pub fn advise(geom: &QrGeometry, sharpness: f32) -> Advice {
     Advice::Ok
 }
 
-/// Varianza del laplaciano sobre una región: la medida de nitidez habitual.
+/// Laplacian variance over a region: the usual sharpness measure.
 ///
-/// Una imagen enfocada tiene bordes marcados, y el laplaciano —que responde a
-/// los cambios bruscos— se dispara en ellos. Al desenfocar, los bordes se
-/// suavizan y la varianza cae. Un QR es casi todo bordes, así que el indicador
-/// es especialmente claro sobre esta clase de imagen.
+/// A focused image has sharp edges, and the Laplacian — which responds to abrupt
+/// changes — spikes at them. As focus softens, the edges smear and the variance
+/// falls. A QR code is almost all edges, so the indicator is especially clear on
+/// this class of image.
+///
+/// **Known limitation:** noise also raises the variance. A noisy, blurry image
+/// can score higher than a clean, slightly blurry one. Using this as a focus
+/// criterion in production calls for denoising first, or combining it with
+/// another measure.
 #[must_use]
 pub fn sharpness(
     width: usize,
@@ -235,21 +240,21 @@ pub fn sharpness(
         return 0.0;
     }
 
-    let mut suma = 0.0f64;
-    let mut suma_cuadrados = 0.0f64;
+    let mut sum = 0.0f64;
+    let mut sum_squares = 0.0f64;
     let mut n = 0u64;
 
     for y in y0..y1 {
         for x in x0..x1 {
             let i = y * width + x;
-            // Núcleo laplaciano de 4 vecinos.
+            // Four-neighbour Laplacian kernel.
             let lap = 4.0 * f64::from(pixels[i])
                 - f64::from(pixels[i - 1])
                 - f64::from(pixels[i + 1])
                 - f64::from(pixels[i - width])
                 - f64::from(pixels[i + width]);
-            suma += lap;
-            suma_cuadrados += lap * lap;
+            sum += lap;
+            sum_squares += lap * lap;
             n += 1;
         }
     }
@@ -257,6 +262,6 @@ pub fn sharpness(
     if n == 0 {
         return 0.0;
     }
-    let media = suma / n as f64;
-    ((suma_cuadrados / n as f64) - media * media).max(0.0) as f32
+    let mean = sum / n as f64;
+    ((sum_squares / n as f64) - mean * mean).max(0.0) as f32
 }

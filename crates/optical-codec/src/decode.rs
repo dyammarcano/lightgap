@@ -1,50 +1,51 @@
-//! De un frame en escala de grises a payloads.
+//! A greyscale frame to payloads.
 //!
-//! Un frame puede contener más de un código —dos pantallas en el encuadre, un
-//! reflejo— así que se devuelven todos los que se hayan podido leer, con su
-//! geometría. Quedarse solo con el primero descartaría en silencio al par
-//! bueno cuando además hay un reflejo en el campo de visión.
+//! A frame may hold more than one code — two displays in view, a reflection — so
+//! every code that could be read is returned, with its geometry. Keeping only
+//! the first would silently discard the real peer whenever a reflection also
+//! happens to be in the field of view.
 
 use optical_protocol::wire::{Pdu, WireError};
 
 use crate::geometry::{sharpness, Point, QrGeometry};
 
-/// Un código leído del frame.
+/// A code read out of the frame.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Detection {
     pub payload: Vec<u8>,
     pub geometry: QrGeometry,
 }
 
-/// Un código que se detectó pero no se pudo leer.
+/// A code that was detected but could not be read.
 ///
-/// Se informa aparte porque significa algo distinto: haber encontrado la
-/// rejilla y fallar al decodificarla dice que el encuadre está bien y lo que
-/// sobra es densidad o falta enfoque. No detectar nada dice que no hay nadie
-/// enfrente, o que está muy lejos.
+/// Reported separately because it means something different: finding the grid
+/// and failing to decode it says the framing is fine and what is excessive is
+/// density, or what is missing is focus. Detecting nothing says nobody is there,
+/// or they are too far away.
 #[derive(Debug, Clone, PartialEq)]
 pub struct FailedDetection {
     pub geometry: QrGeometry,
 }
 
-/// Lo que se sacó de un frame.
+/// What came out of one frame.
 #[derive(Debug, Clone, PartialEq, Default)]
 pub struct FrameScan {
     pub detections: Vec<Detection>,
     pub failed: Vec<FailedDetection>,
-    /// Nitidez de la zona del primer código, o del frame si no hubo ninguno.
+    /// Sharpness over the first code's area, or over the frame if there was
+    /// none.
     pub sharpness: f32,
 }
 
 impl FrameScan {
-    /// Cuántas rejillas se vieron, se leyeran o no.
+    /// How many grids were seen, readable or not.
     #[must_use]
     pub fn grids_seen(&self) -> usize {
         self.detections.len() + self.failed.len()
     }
 
-    /// La geometría más relevante: la del primer código legible, y si no hay
-    /// ninguno la del primero que se vio.
+    /// The most relevant geometry: that of the first readable code, or failing
+    /// that, of the first one seen.
     #[must_use]
     pub fn best_geometry(&self) -> Option<QrGeometry> {
         self.detections
@@ -54,9 +55,9 @@ impl FrameScan {
     }
 }
 
-/// Busca y lee todos los códigos de un frame en escala de grises.
+/// Finds and reads every code in a greyscale frame.
 ///
-/// `pixels` va por filas, un byte por píxel.
+/// `pixels` is row-major, one byte per pixel.
 #[must_use]
 pub fn scan_greyscale(width: usize, height: usize, pixels: &[u8]) -> FrameScan {
     if width == 0 || height == 0 || pixels.len() < width * height {
@@ -99,18 +100,18 @@ pub fn scan_greyscale(width: usize, height: usize, pixels: &[u8]) -> FrameScan {
                 });
             }
             Err(_) => {
-                // Sin metadatos no se conoce la versión; se estima el número de
-                // módulos como desconocido y la geometría sirve igual para
-                // orientar el encuadre, que es para lo que hace falta.
+                // Without metadata the version is unknown, so the module count
+                // is left at zero. The geometry still serves to guide framing,
+                // which is what it is needed for here.
                 let geometry = QrGeometry::from_corners(corners, 0, width as u32, height as u32);
                 scan.failed.push(FailedDetection { geometry });
             }
         }
     }
 
-    // La nitidez se mide sobre la zona del código, no sobre el frame entero: un
-    // fondo con textura puede dar una varianza alta y ocultar que justo el
-    // código está borroso.
+    // Sharpness is measured over the code's area, not the whole frame: a
+    // textured background can produce a high variance and hide the fact that the
+    // code specifically is blurry.
     let region = scan.best_geometry().map(|g| {
         let xs = g.corners.map(|p| p.x);
         let ys = g.corners.map(|p| p.y);
@@ -133,11 +134,11 @@ pub fn scan_greyscale(width: usize, height: usize, pixels: &[u8]) -> FrameScan {
     scan
 }
 
-/// Lee un frame y devuelve directamente las PDUs válidas que contenía.
+/// Reads a frame and returns the valid PDUs it contained.
 ///
-/// Los payloads que no son PDUs válidas se descartan sin ruido: en el campo de
-/// visión puede haber cualquier código de barras del mundo real, y no es un
-/// error que un cartel de la pared no hable nuestro protocolo.
+/// Payloads that are not valid PDUs are discarded quietly: the field of view may
+/// contain any barcode in the real world, and a poster on the wall not speaking
+/// our protocol is not an error.
 #[must_use]
 pub fn scan_pdus(width: usize, height: usize, pixels: &[u8]) -> (Vec<Pdu>, FrameScan) {
     let scan = scan_greyscale(width, height, pixels);
@@ -149,10 +150,11 @@ pub fn scan_pdus(width: usize, height: usize, pixels: &[u8]) -> (Vec<Pdu>, Frame
     (pdus, scan)
 }
 
-/// Igual que [`scan_pdus`] pero informando de por qué se descartó cada payload.
+/// Like [`scan_pdus`] but reporting why each payload was discarded.
 ///
-/// Útil para diagnosticar: distinguir «no era una PDU» de «era una PDU con el
-/// CRC mal» separa un cartel de la pared de un enlace que va justo de densidad.
+/// Useful for diagnosis: telling "not a PDU" apart from "a PDU with a bad CRC"
+/// separates a poster on the wall from a link running right at its density
+/// limit.
 #[must_use]
 pub fn scan_pdus_verbose(
     width: usize,

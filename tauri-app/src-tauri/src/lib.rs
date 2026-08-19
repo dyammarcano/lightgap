@@ -1,4 +1,4 @@
-// FASE 0: `spike` es codigo desechable, se borra al cerrar la medicion.
+// PHASE 0: `spike` is throwaway code, deleted once the measurement is closed.
 mod spike;
 
 // Learn more about Tauri commands at https://tauri.app/develop/calling-rust/

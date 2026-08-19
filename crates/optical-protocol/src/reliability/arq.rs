@@ -1,48 +1,49 @@
-//! Ventana deslizante con retransmisión selectiva.
+//! Sliding window with selective retransmission.
 //!
-//! El objeto se parte en chunks de tamaño fijo indexados densamente. El emisor
-//! mantiene una ventana de chunks en vuelo; el receptor confirma de forma
-//! acumulativa y además lista los huecos que ve por delante del acumulado.
+//! The object is split into fixed-size chunks with dense indices. The sender
+//! keeps a window of chunks in flight; the receiver acknowledges cumulatively
+//! and also lists the gaps it can see beyond the cumulative point.
 //!
-//! El coste de esta estrategia en un canal óptico es real: cada confirmación
-//! necesita que el receptor muestre un QR y que el emisor lo capture y lo
-//! decodifique. Por eso la ventana importa tanto — con ventana 1 esto degenera
-//! en stop-and-wait, que es lo que hace inutilizable el enlace.
+//! The cost of this strategy on an optical channel is real: every
+//! acknowledgement requires the receiver to display a QR code and the sender to
+//! capture and decode it. That is why the window matters so much — with a window
+//! of one this degenerates into stop-and-wait, which is what makes the link
+//! unusable.
 
 use super::{Feedback, Progress, Receiver, RecvError, Sender, Symbol};
 
-/// Cuántos huecos caben en una realimentación.
+/// How many gaps fit in one feedback message.
 ///
-/// Acotado porque un `Feedback` viaja en el payload de un PDU, y ese payload
-/// tiene que caber en un marco del canal. Un ACK que no entra en un QR no es un
-/// ACK. Si hay más huecos que este límite se mandan los más antiguos: son los
-/// que bloquean el avance del acumulado.
+/// Bounded because a `Feedback` travels in a PDU payload, and that payload has
+/// to fit inside a channel frame. An acknowledgement that does not fit in a QR
+/// code is not an acknowledgement. When there are more gaps than this limit the
+/// oldest are sent: those are the ones blocking the cumulative point.
 pub const MAX_MISSING_REPORTED: usize = 32;
 
-/// Ventana inicial, en chunks. La negociación de la Fase 3 la ajusta.
+/// Initial window, in chunks. Calibration adjusts it.
 pub const DEFAULT_WINDOW: u32 = 16;
 
-/// El lado que tiene el objeto.
+/// The side that holds the object.
 #[derive(Debug)]
 pub struct ArqSender {
     object: Vec<u8>,
     chunk_size: usize,
     total_chunks: u32,
-    /// Primer chunk sin confirmar.
+    /// First unacknowledged chunk.
     base: u32,
-    /// Primer chunk que no se ha enviado nunca.
+    /// First chunk never yet sent.
     next: u32,
     window: u32,
-    /// Huecos que el receptor ha pedido, en orden de llegada.
+    /// Gaps the receiver asked for, in arrival order.
     retransmit: Vec<u32>,
 }
 
 impl ArqSender {
     /// # Panics
-    /// Si `chunk_size` es cero.
+    /// If `chunk_size` is zero.
     #[must_use]
     pub fn new(object: Vec<u8>, chunk_size: usize) -> Self {
-        assert!(chunk_size > 0, "el tamaño de chunk no puede ser cero");
+        assert!(chunk_size > 0, "chunk size cannot be zero");
         let total_chunks = object.len().div_ceil(chunk_size) as u32;
         Self {
             object,
@@ -72,13 +73,13 @@ impl ArqSender {
 
 impl Sender for ArqSender {
     fn next_symbol(&mut self, max_payload: usize) -> Option<Symbol> {
-        // Los huecos primero: son los que bloquean el acumulado, y hasta que se
-        // llenen el receptor no puede avanzar por mucho que reciba lo demás.
+        // Gaps first: they are what blocks the cumulative point, and until they
+        // are filled the receiver cannot advance no matter what else arrives.
         if let Some(&id) = self.retransmit.first() {
             let bytes = self.chunk(id)?;
-            // Un chunk no se puede trocear: el índice es la identidad del dato.
-            // Si no cabe, el perfil está mal negociado, y no mandar nada es
-            // mejor que mandar algo que el receptor no sabrá recomponer.
+            // A chunk cannot be split: the index is the identity of the data. If
+            // it does not fit, the profile is mis-negotiated, and sending
+            // nothing beats sending something the receiver cannot reassemble.
             if bytes.len() > max_payload {
                 return None;
             }
@@ -92,7 +93,7 @@ impl Sender for ArqSender {
             if bytes.len() > max_payload {
                 return None;
             }
-            // El estado solo avanza cuando el símbolo sale de verdad.
+            // State only advances once the symbol actually goes out.
             self.next += 1;
             return Some(Symbol { id, bytes });
         }
@@ -107,9 +108,9 @@ impl Sender for ArqSender {
             window,
         } = feedback
         else {
-            // Realimentación de otro modo: se ignora en vez de entrar en pánico.
-            // Un par que hable otro dialecto es un fallo de negociación, no una
-            // razón para tumbar la sesión.
+            // Feedback from another mode: ignored rather than panicked on. A
+            // peer speaking a different dialect is a negotiation failure, not a
+            // reason to tear down the session.
             return;
         };
 
@@ -118,8 +119,8 @@ impl Sender for ArqSender {
             self.window = u32::from(*window);
         }
 
-        // Solo interesan los huecos que siguen por delante del acumulado; los
-        // anteriores ya están dados por buenos.
+        // Only gaps still beyond the cumulative point matter; earlier ones are
+        // already accounted for.
         self.retransmit.retain(|id| *id >= self.base);
         for id in missing {
             if *id >= self.base && *id < self.total_chunks && !self.retransmit.contains(id) {
@@ -140,7 +141,7 @@ impl Sender for ArqSender {
     }
 }
 
-/// El lado que reconstruye.
+/// The side that reassembles.
 #[derive(Debug)]
 pub struct ArqReceiver {
     buffer: Vec<u8>,
@@ -148,8 +149,8 @@ pub struct ArqReceiver {
     chunk_size: usize,
     total_len: usize,
     total_chunks: u32,
-    /// Primer chunk que falta. Se mantiene incremental para no recorrer el
-    /// mapa entero en cada símbolo.
+    /// First missing chunk. Kept incrementally so as not to walk the whole map
+    /// on every symbol.
     cumulative: u32,
     count: u32,
     taken: bool,
@@ -157,10 +158,10 @@ pub struct ArqReceiver {
 
 impl ArqReceiver {
     /// # Panics
-    /// Si `chunk_size` es cero.
+    /// If `chunk_size` is zero.
     #[must_use]
     pub fn new(total_len: usize, chunk_size: usize) -> Self {
-        assert!(chunk_size > 0, "el tamaño de chunk no puede ser cero");
+        assert!(chunk_size > 0, "chunk size cannot be zero");
         let total_chunks = total_len.div_ceil(chunk_size) as u32;
         Self {
             buffer: vec![0; total_len],
@@ -174,8 +175,8 @@ impl ArqReceiver {
         }
     }
 
-    /// Longitud que debe tener el chunk `id`. El último es más corto salvo que
-    /// el objeto sea múltiplo exacto del tamaño de chunk.
+    /// Length chunk `id` should have. The last one is shorter unless the object
+    /// is an exact multiple of the chunk size.
     fn expected_len(&self, id: u32) -> usize {
         let start = id as usize * self.chunk_size;
         (start + self.chunk_size).min(self.total_len) - start
@@ -206,8 +207,9 @@ impl Receiver for ArqReceiver {
 
         let idx = symbol.id as usize;
         if self.received[idx] {
-            // Duplicado. No es un error: el medio los produce solo, y en un
-            // canal donde cada QR se muestra varios refrescos es lo esperable.
+            // A duplicate. Not an error: the medium produces them on its own,
+            // and on a channel where every QR code is held for several refreshes
+            // it is the expected case.
             return Ok(());
         }
 

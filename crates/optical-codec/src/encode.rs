@@ -1,28 +1,28 @@
-//! De bytes a matriz de módulos.
+//! Bytes to a module matrix.
 //!
-//! El codificador devuelve **la matriz, no píxeles**. Quién la dibuja y a qué
-//! tamaño es otra decisión: la interfaz la pinta en un canvas, el banco de
-//! pruebas la rasteriza con distorsión, y mañana un panel de LEDs la encendería
-//! módulo a módulo. Mezclar «qué es el código» con «cómo se dibuja» ataría el
-//! protocolo a una pantalla concreta.
+//! The encoder returns **the matrix, not pixels**. Who draws it and at what size
+//! is a separate decision: the UI paints it on a canvas, the test bench
+//! rasterizes it with distortion, and tomorrow an LED panel would light it up
+//! module by module. Mixing "what the code is" with "how it is drawn" would tie
+//! the protocol to one particular display.
 
 use qrcode::{EcLevel, QrCode};
 
-/// Nivel de corrección de errores.
+/// Error correction level.
 ///
-/// El compromiso es directo: más corrección, menos payload por marco pero más
-/// tolerancia a desenfoque y reflejos. La calibración de la Fase 3 lo elige
-/// midiendo goodput real, porque el nivel que más datos mete no es el que más
-/// datos entrega.
+/// The trade-off is direct: more correction means less payload per frame but
+/// more tolerance for blur and reflections. Calibration picks it by measuring
+/// real goodput, because the level that packs in the most data is not the one
+/// that delivers the most.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum Ecc {
-    /// ~7 % de tolerancia. Máxima capacidad.
+    /// About 7% tolerance. Maximum capacity.
     L,
-    /// ~15 %. Equilibrio.
+    /// About 15%. Balanced.
     M,
-    /// ~25 %. Robusto.
+    /// About 25%. Robust.
     Q,
-    /// ~30 %. Máxima tolerancia, mínima capacidad.
+    /// About 30%. Maximum tolerance, minimum capacity.
     H,
 }
 
@@ -36,27 +36,27 @@ impl Ecc {
         }
     }
 
-    /// Todos los niveles, de más capacidad a más robustez.
+    /// Every level, from most capacity to most robustness.
     #[must_use]
     pub const fn all() -> [Self; 4] {
         [Self::L, Self::M, Self::Q, Self::H]
     }
 }
 
-/// Por qué no se pudo construir el marco.
+/// Why the frame could not be built.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum EncodeError {
-    #[error("{len} B no caben en un QR con corrección {ecc:?}")]
+    #[error("{len} B do not fit a QR code at correction level {ecc:?}")]
     TooLarge { len: usize, ecc: Ecc },
 
-    #[error("el codificador rechazó los datos: {0}")]
+    #[error("the encoder rejected the data: {0}")]
     Rejected(String),
 }
 
-/// Una matriz cuadrada de módulos, sin zona de silencio.
+/// A square matrix of modules, without the quiet zone.
 ///
-/// La zona de silencio no se incluye porque es cosa del dibujado: quien pinta
-/// decide cuántos módulos de margen deja, y el margen no forma parte del código.
+/// The quiet zone is excluded because it belongs to drawing: whoever paints
+/// decides how much margin to leave, and the margin is not part of the code.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Modules {
     size: usize,
@@ -65,7 +65,7 @@ pub struct Modules {
 }
 
 impl Modules {
-    /// Módulos por lado.
+    /// Modules per side.
     #[must_use]
     pub fn size(&self) -> usize {
         self.size
@@ -76,8 +76,8 @@ impl Modules {
         self.ecc
     }
 
-    /// Si el módulo en `(x, y)` es oscuro. Fuera de rango devuelve `false`, que
-    /// es el color del fondo.
+    /// Whether the module at `(x, y)` is dark. Out of range returns `false`,
+    /// which is the background colour.
     #[must_use]
     pub fn is_dark(&self, x: usize, y: usize) -> bool {
         if x >= self.size || y >= self.size {
@@ -86,24 +86,24 @@ impl Modules {
         self.dark[y * self.size + x]
     }
 
-    /// La matriz en crudo, por filas.
+    /// The raw matrix, row-major.
     #[must_use]
     pub fn as_slice(&self) -> &[bool] {
         &self.dark
     }
 
-    /// Rasteriza a escala de grises: 0 oscuro, 255 claro.
+    /// Rasterizes to greyscale: 0 dark, 255 light.
     ///
-    /// `scale` son píxeles por módulo y `quiet` módulos de margen. La zona de
-    /// silencio no es decorativa: sin ella el detector no distingue dónde
-    /// empieza el código, y cuatro módulos es el mínimo del estándar.
+    /// `scale` is pixels per module and `quiet` is the margin in modules. The
+    /// quiet zone is not decorative: without it the detector cannot tell where
+    /// the code begins, and four modules is the standard's minimum.
     ///
-    /// Devuelve `(ancho, alto, píxeles)`.
+    /// Returns `(width, height, pixels)`.
     #[must_use]
     pub fn render_greyscale(&self, scale: usize, quiet: usize) -> (usize, usize, Vec<u8>) {
-        let lado_modulos = self.size + quiet * 2;
-        let lado_px = lado_modulos * scale;
-        let mut px = vec![255u8; lado_px * lado_px];
+        let side_modules = self.size + quiet * 2;
+        let side_px = side_modules * scale;
+        let mut px = vec![255u8; side_px * side_px];
 
         for my in 0..self.size {
             for mx in 0..self.size {
@@ -113,21 +113,21 @@ impl Modules {
                 let x0 = (mx + quiet) * scale;
                 let y0 = (my + quiet) * scale;
                 for y in y0..y0 + scale {
-                    let fila = y * lado_px;
-                    px[fila + x0..fila + x0 + scale].fill(0);
+                    let row = y * side_px;
+                    px[row + x0..row + x0 + scale].fill(0);
                 }
             }
         }
 
-        (lado_px, lado_px, px)
+        (side_px, side_px, px)
     }
 }
 
-/// Construye el marco óptico para un payload.
+/// Builds the optical frame for a payload.
 pub fn encode(payload: &[u8], ecc: Ecc) -> Result<Modules, EncodeError> {
     let code = QrCode::with_error_correction_level(payload, ecc.to_level()).map_err(|e| {
-        // `qrcode` distingue el caso de capacidad, que es el único accionable:
-        // significa que hay que bajar el payload o subir la versión.
+        // `qrcode` distinguishes the capacity case, which is the only actionable
+        // one: it means lowering the payload or raising the version.
         if matches!(e, qrcode::types::QrError::DataTooLong) {
             EncodeError::TooLarge {
                 len: payload.len(),
@@ -148,20 +148,20 @@ pub fn encode(payload: &[u8], ecc: Ecc) -> Result<Modules, EncodeError> {
     Ok(Modules { size, dark, ecc })
 }
 
-/// Payload máximo **garantizado** para datos binarios arbitrarios, en bytes.
+/// Payload size **guaranteed** to fit for arbitrary binary data, in bytes.
 ///
-/// Se mide probando con relleno incompresible, que es el peor caso y el que
-/// describe a nuestras PDUs: llevan CRC y payloads cifrados o codificados, sin
-/// estructura que el codificador pueda aprovechar.
+/// Measured by probing with incompressible filler, which is the worst case and
+/// describes our PDUs: they carry a CRC and encrypted or coded payloads, with no
+/// structure the encoder can exploit.
 ///
-/// Contenido con suerte cabe más: `qrcode` elige el modo óptimo por tramos, y
-/// una ristra de dígitos ASCII entra en modo numérico a 3,33 bits por carácter
-/// en vez de 8. Por eso esto es una **cota inferior segura**, no la capacidad de
-/// un dato concreto — para eso, probar a codificarlo.
+/// Luckier content fits more: `qrcode` picks the optimal mode per run, and a
+/// stretch of ASCII digits goes into numeric mode at 3.33 bits per character
+/// instead of 8. So this is a **safe lower bound**, not the capacity of any
+/// particular blob — for that, try encoding it.
 #[must_use]
 pub fn max_payload(ecc: Ecc) -> usize {
-    // Búsqueda binaria sobre el mayor tamaño que codifica. El techo teórico del
-    // modo byte en versión 40 con corrección L es 2953 B.
+    // Binary search for the largest size that encodes. The theoretical ceiling
+    // for byte mode at version 40 with correction L is 2953 B.
     let mut lo = 0usize;
     let mut hi = 3000usize;
     while lo < hi {

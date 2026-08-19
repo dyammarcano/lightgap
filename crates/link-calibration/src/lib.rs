@@ -1,8 +1,8 @@
-//! Negociación y ajuste de perfiles de enlace, agnósticos del medio.
+//! Link profile negotiation and adjustment, agnostic to the medium.
 //!
-//! Ni la escalera de sondas ni el control adaptativo saben qué es un QR. Eso es
-//! deliberado: el canal acústico negociará su velocidad de símbolo con
-//! exactamente la misma escalera, y un tercer medio también.
+//! Neither the probe ladder nor the adaptive controller knows what a QR code is.
+//! That is deliberate: the acoustic channel will negotiate its symbol rate with
+//! exactly the same ladder, and so would a third medium.
 
 pub mod adaptive;
 pub mod ladder;

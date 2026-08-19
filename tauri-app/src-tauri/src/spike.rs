@@ -1,59 +1,65 @@
-//! FASE 0 — SPIKE DESECHABLE. Se borra entero al terminar la medición.
+//! PHASE 0 — THROWAWAY SPIKE. Deleted in full once the measurement is done.
 //!
-//! Mide el coste real de la ruta híbrida de cámara elegida en el diseño:
-//! `getUserMedia` en el WebView → frame en gris por IPC → decode en el backend.
+//! Measures the real cost of the hybrid camera path chosen in the design:
+//! `getUserMedia` in the WebView, QR decoding in the backend.
 //!
-//! Pregunta a responder: ¿sostiene ≥10 decodificaciones/s con <30% de un core?
-//! Si no, hay tres repliegues definidos en el diseño (recorte a ROI, decode en
-//! WASM, `nokhwa` nativo).
+//! Question to answer: does it sustain 10 or more decodes per second at under
+//! 30% of one core? If not, the design defines three fallbacks (crop to the
+//! region of interest, decode in WASM, native `nokhwa`).
 //!
-//! Compara dos rutas de IPC deliberadamente:
-//!   - `spike_decode_raw`  → `InvokeBody::Raw`, bytes crudos
-//!   - `spike_decode_json` → argumentos JSON, cada byte serializado como número
+//! It deliberately compares two IPC paths:
+//!   - `spike_decode_raw`  -> `InvokeBody::Raw`, raw bytes
+//!   - `spike_decode_json` -> JSON arguments, every byte serialized as a number
 //!
-//! OJO (verificado en tauri-2.11.5/scripts/process-ipc-message-fn.js): la ruta
-//! cruda SOLO se activa si el typed array es el argumento COMPLETO del invoke.
-//! Metido como campo de un objeto cae al `JSON.stringify`, que convierte cada
-//! byte en un número en texto. Ese es justo el caso patológico que medimos.
+//! NOTE (verified in tauri-2.11.5/scripts/process-ipc-message-fn.js): the raw
+//! path only engages when the typed array is the ENTIRE invoke argument. Nested
+//! inside an object it falls through to `JSON.stringify`, which turns every byte
+//! into a number in text. That is exactly the pathological case being measured.
 
 use std::time::Instant;
 
 use serde::{Deserialize, Serialize};
 use tauri::ipc::{InvokeBody, Request};
 
-/// Resultado de un intento de decodificación sobre un frame.
+/// Result of one decode attempt over a frame.
 #[derive(Debug, Serialize)]
 pub struct DecodeReport {
-    /// Bytes que llegaron al backend (incluye la cabecera de 8 B).
+    /// Bytes that reached the backend, including the 8 B header.
     pub bytes_in: usize,
-    /// Microsegundos gastados solo en detectar y decodificar, sin IPC.
+    /// Microseconds spent purely detecting and decoding, excluding IPC.
     pub decode_us: u64,
-    /// Microsegundos gastados en deserializar los argumentos (delata la ruta JSON).
+    /// Microseconds spent deserializing the arguments (this is what exposes the
+    /// JSON path).
     pub deserialize_us: u64,
-    /// Cuántas rejillas QR se detectaron en el frame.
+    /// How many QR grids were detected in the frame.
     pub grids: usize,
-    /// Contenido de la primera rejilla decodificada con éxito.
+    /// Contents of the first successfully decoded grid.
     pub content: Option<String>,
 }
 
-/// Cabecera binaria mínima al frente del buffer en gris: ancho y alto, u32 LE.
+/// Minimal binary header at the front of the greyscale buffer: width and height
+/// as little-endian u32.
 ///
-/// Va dentro del payload en vez de en cabeceras HTTP a propósito: es lo que el
-/// protocolo real hará de todas formas, y evita plomería de headers en el spike.
+/// It lives inside the payload rather than in HTTP headers on purpose: it is
+/// what the real protocol will do anyway, and it avoids header plumbing in the
+/// spike.
 const HEADER_LEN: usize = 8;
 
 fn decode_greyscale(buf: &[u8]) -> Result<(usize, Option<String>), String> {
     if buf.len() < HEADER_LEN {
-        return Err(format!("buffer de {} B, menor que la cabecera", buf.len()));
+        return Err(format!(
+            "buffer of {} B, smaller than the header",
+            buf.len()
+        ));
     }
     let width = u32::from_le_bytes(buf[0..4].try_into().unwrap()) as usize;
     let height = u32::from_le_bytes(buf[4..8].try_into().unwrap()) as usize;
     let pixels = &buf[HEADER_LEN..];
 
-    let expected = width.checked_mul(height).ok_or("dimensiones desbordan")?;
+    let expected = width.checked_mul(height).ok_or("dimensions overflow")?;
     if pixels.len() != expected {
         return Err(format!(
-            "esperaba {expected} px para {width}x{height}, llegaron {}",
+            "expected {expected} px for {width}x{height}, got {}",
             pixels.len()
         ));
     }
@@ -73,12 +79,12 @@ fn decode_greyscale(buf: &[u8]) -> Result<(usize, Option<String>), String> {
     Ok((found, content))
 }
 
-/// Ruta rápida: el frame llega como cuerpo binario, sin pasar por JSON.
+/// Fast path: the frame arrives as a raw binary body, never touching JSON.
 #[tauri::command]
 pub fn spike_decode_raw(request: Request<'_>) -> Result<DecodeReport, String> {
     let t_deser = Instant::now();
     let InvokeBody::Raw(buf) = request.body() else {
-        return Err("se esperaba un cuerpo binario; ¿el typed array iba anidado?".into());
+        return Err("expected a raw binary body; was the typed array nested?".into());
     };
     let deserialize_us = t_deser.elapsed().as_micros() as u64;
 
@@ -97,12 +103,12 @@ pub fn spike_decode_raw(request: Request<'_>) -> Result<DecodeReport, String> {
 
 #[derive(Debug, Deserialize)]
 pub struct JsonFrame {
-    /// Mismo layout que la ruta cruda, pero cada byte viaja como número JSON.
+    /// Same layout as the raw path, but every byte travels as a JSON number.
     pub frame: Vec<u8>,
 }
 
-/// Ruta de control: idéntica salvo que los bytes cruzan el IPC como texto JSON.
-/// Existe solo para cuantificar la diferencia y justificar la ruta cruda.
+/// Control path: identical except the bytes cross IPC as JSON text. It exists
+/// solely to quantify the difference and justify the raw path.
 #[tauri::command]
 pub fn spike_decode_json(payload: JsonFrame) -> Result<DecodeReport, String> {
     let t_decode = Instant::now();
@@ -112,16 +118,16 @@ pub fn spike_decode_json(payload: JsonFrame) -> Result<DecodeReport, String> {
     Ok(DecodeReport {
         bytes_in: payload.frame.len(),
         decode_us,
-        // La deserialización ya ocurrió antes de entrar aquí: el coste de esta
-        // ruta se mide desde el frontend, como diferencia de reloj de pared.
+        // Deserialization already happened before entering here: this path's
+        // cost is measured from the frontend, as a wall-clock difference.
         deserialize_us: 0,
         grids,
         content,
     })
 }
 
-/// Genera el QR que el spike muestra en pantalla para que la webcam lo mire.
-/// Devuelve SVG para que Leptos lo inyecte tal cual.
+/// Generates the QR code the spike displays for the webcam to look at. Returns
+/// SVG so Leptos can inject it directly.
 #[tauri::command]
 pub fn spike_make_qr(payload_bytes: usize, ecc: char, counter: u64) -> Result<String, String> {
     use qrcode::{render::svg, EcLevel, QrCode};
@@ -131,11 +137,12 @@ pub fn spike_make_qr(payload_bytes: usize, ecc: char, counter: u64) -> Result<St
         'M' => EcLevel::M,
         'Q' => EcLevel::Q,
         'H' => EcLevel::H,
-        other => return Err(format!("nivel de corrección desconocido: {other}")),
+        other => return Err(format!("unknown correction level: {other}")),
     };
 
-    // El contador va delante para poder medir frescura: si la cámara lee un
-    // contador viejo, el retardo del lazo es visible sin instrumentar nada más.
+    // The counter goes first so freshness can be measured: if the camera reads
+    // an old counter, the loop delay is visible without instrumenting anything
+    // else.
     let prefix = format!("{counter:016x}");
     let mut data = prefix.into_bytes();
     data.resize(payload_bytes.max(data.len()), b'#');

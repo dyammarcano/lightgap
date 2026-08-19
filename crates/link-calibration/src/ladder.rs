@@ -1,26 +1,26 @@
-//! Búsqueda del mayor parámetro que el enlace sostiene.
+//! Search for the largest parameter the link will sustain.
 //!
-//! Duplicar hasta fallar, luego bisecar, y quedarse por debajo con margen. Es
-//! agnóstica del medio a propósito: sirve igual para negociar bytes por QR que
-//! símbolos por segundo por audio. Lo único que necesita saber es «con este
-//! valor, ¿qué tasa de acierto sale?».
+//! Double until it breaks, then bisect, then back off with a margin. Deliberately
+//! medium-agnostic: it works just as well negotiating bytes per QR code as
+//! symbols per second over audio. All it needs to know is "at this value, what
+//! success rate comes out?".
 //!
-//! El margen final no es prudencia decorativa. Un enlace óptico se degrada solo
-//! —alguien mueve el portátil, cambia la luz, el autofoco caza— y operar en el
-//! límite exacto significa caerse a los pocos segundos de haber negociado.
+//! The final margin is not decorative caution. An optical link degrades on its
+//! own — someone shifts a laptop, the light changes, autofocus hunts — and
+//! operating at the exact limit means falling over seconds after negotiating.
 
-/// En qué punto de la búsqueda estamos.
+/// Where the search stands.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Phase {
-    /// Duplicando mientras funcione.
+    /// Doubling while it still works.
     Doubling,
-    /// Bisecando entre el último bueno y el primer malo.
+    /// Bisecting between the last good and the first bad value.
     Bisecting,
-    /// Hay resultado.
+    /// There is a result.
     Settled,
 }
 
-/// Escalera de sondas sobre un parámetro entero.
+/// A probe ladder over an integer parameter.
 #[derive(Debug, Clone)]
 pub struct Ladder {
     min: u32,
@@ -30,30 +30,30 @@ pub struct Ladder {
     first_bad: Option<u32>,
     phase: Phase,
     margin_pct: u8,
-    /// Tasa de acierto a partir de la cual un valor se da por bueno.
+    /// Success rate at or above which a value counts as good.
     threshold: f32,
     probes: u32,
 }
 
-/// Margen por defecto que se descuenta del mayor valor que funcionó.
+/// Default margin deducted from the largest value that worked.
 pub const DEFAULT_MARGIN_PCT: u8 = 15;
 
-/// Tasa de acierto a partir de la cual un valor se considera sostenible.
+/// Success rate at which a value is considered sustainable.
 ///
-/// Alta a propósito. Un perfil que acierta el 90 % obliga a reenviar uno de cada
-/// diez marcos, y en un medio donde cada marco cuesta cien milisegundos eso se
-/// nota más que haber elegido un payload algo menor.
+/// High on purpose. A profile that hits 90% forces a resend of one frame in ten,
+/// and in a medium where each frame costs a hundred milliseconds that hurts more
+/// than having chosen a slightly smaller payload.
 pub const DEFAULT_THRESHOLD: f32 = 0.97;
 
 impl Ladder {
     /// # Panics
-    /// Si el rango es vacío o el valor inicial cae fuera.
+    /// If the range is empty or the starting value falls outside it.
     #[must_use]
     pub fn new(min: u32, max: u32, start: u32) -> Self {
-        assert!(min > 0 && min <= max, "rango inválido: {min}..={max}");
+        assert!(min > 0 && min <= max, "invalid range: {min}..={max}");
         assert!(
             (min..=max).contains(&start),
-            "el arranque {start} cae fuera de {min}..={max}"
+            "start {start} falls outside {min}..={max}"
         );
         Self {
             min,
@@ -80,7 +80,7 @@ impl Ladder {
         self
     }
 
-    /// Valor que hay que probar ahora.
+    /// The value to probe right now.
     #[must_use]
     pub fn current(&self) -> u32 {
         self.current
@@ -91,14 +91,14 @@ impl Ladder {
         self.phase
     }
 
-    /// Cuántas sondas se han lanzado. Sirve para acotar la duración de la
-    /// calibración: nadie sostiene dos portátiles enfrentados indefinidamente.
+    /// How many probes have been issued. Useful for bounding how long
+    /// calibration takes: nobody holds two laptops face to face indefinitely.
     #[must_use]
     pub fn probes(&self) -> u32 {
         self.probes
     }
 
-    /// Incorpora el resultado de probar [`Ladder::current`].
+    /// Takes in the result of probing [`Ladder::current`].
     pub fn record(&mut self, success_rate: f32) {
         if self.phase == Phase::Settled {
             return;
@@ -116,10 +116,10 @@ impl Ladder {
             Phase::Doubling => {
                 if !ok {
                     if self.best_ok.is_none() {
-                        // Falló el arranque sin que nada haya funcionado aún.
-                        // Antes de rendirse hay que probar el suelo: rendirse
-                        // aquí descartaría un enlace que sí da para el mínimo,
-                        // solo porque se empezó a probar demasiado arriba.
+                        // The starting value failed and nothing has worked yet.
+                        // Before giving up, probe the floor: giving up here would
+                        // discard a link that does manage the minimum, merely
+                        // because probing started too high.
                         if self.current > self.min {
                             self.current = self.min;
                         } else {
@@ -133,15 +133,16 @@ impl Ladder {
                 }
 
                 if self.first_bad.is_some() {
-                    // Ya se conoce un fallo por arriba: seguir duplicando lo
-                    // rebasaría, así que toca bisecar.
+                    // A failure above is already known: doubling further would
+                    // overshoot it, so bisect instead.
                     self.phase = Phase::Bisecting;
                     self.step_bisect();
                     return;
                 }
 
                 if self.current >= self.max {
-                    // Llegó al techo funcionando: no hay más que buscar.
+                    // Reached the ceiling while still working: nothing more to
+                    // search for.
                     self.phase = Phase::Settled;
                 } else {
                     self.current = self.current.saturating_mul(2).min(self.max);
@@ -157,7 +158,7 @@ impl Ladder {
             self.best_ok.unwrap_or(self.min),
             self.first_bad.unwrap_or(self.max),
         );
-        // Con los extremos pegados no queda nada entre medias que probar.
+        // With the ends adjacent there is nothing in between left to probe.
         if hi <= lo + 1 {
             self.phase = Phase::Settled;
             return;
@@ -170,27 +171,27 @@ impl Ladder {
         self.current = mid;
     }
 
-    /// Corta la búsqueda y se queda con lo mejor conocido.
+    /// Cuts the search short and keeps the best known value.
     ///
-    /// Hace falta porque la calibración tiene presupuesto de tiempo: es
-    /// preferible un perfil conservador ya que uno óptimo dentro de un minuto.
+    /// Needed because calibration has a time budget: a conservative profile now
+    /// beats an optimal one a minute from now.
     pub fn give_up(&mut self) {
         self.phase = Phase::Settled;
     }
 
-    /// Valor recomendado, con el margen ya descontado.
+    /// Recommended value, with the margin already deducted.
     ///
-    /// `None` si no se encontró ningún valor que funcionara: en ese caso el
-    /// enlace no da ni para el mínimo y hay que arreglar el encuadre, no
-    /// negociar.
+    /// `None` if no value was found that worked: in that case the link cannot
+    /// even manage the minimum, and what needs fixing is the framing, not the
+    /// negotiation.
     #[must_use]
     pub fn settled(&self) -> Option<u32> {
         if self.phase != Phase::Settled {
             return None;
         }
         let best = self.best_ok?;
-        let con_margen =
+        let with_margin =
             (u64::from(best) * u64::from(100 - u16::from(self.margin_pct)) / 100) as u32;
-        Some(con_margen.max(self.min))
+        Some(with_margin.max(self.min))
     }
 }

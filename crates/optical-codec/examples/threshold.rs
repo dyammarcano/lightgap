@@ -1,5 +1,6 @@
-//! Mide cuántos píxeles por módulo hace falta de verdad, barriendo escalas
-//! fraccionarias. El resultado fija MIN_PIXELS_PER_MODULE con datos.
+//! Measures how many pixels per module are actually needed, by sweeping
+//! fractional scales. The result is what fixes `MIN_PIXELS_PER_MODULE` from data
+//! rather than from intuition.
 
 use optical_codec::decode::scan_greyscale;
 use optical_codec::distort::{capture, Conditions};
@@ -10,7 +11,7 @@ fn payload(n: usize) -> Vec<u8> {
 }
 
 fn main() {
-    // Bins de 0,5 px/módulo entre 2 y 10.
+    // Bins of 0.5 px/module between 2 and 12.
     let mut ok = [0u32; 20];
     let mut total = [0u32; 20];
 
@@ -18,45 +19,46 @@ fn main() {
         let Ok(m) = encode(&payload(n), Ecc::Q) else {
             continue;
         };
-        let modulos = m.size() as f32;
-        for paso in 0..90 {
-            let fill = 0.15 + paso as f32 * 0.009;
+        let modules = m.size() as f32;
+        for step in 0..90 {
+            let fill = 0.15 + step as f32 * 0.009;
             let cond = Conditions {
                 fill,
                 ..Conditions::ideal()
             };
             let (w, h, px) = capture(&m, &cond);
             let scan = scan_greyscale(w, h, &px);
-            let leido = scan
+            let read = scan
                 .detections
                 .first()
                 .map(|d| d.payload == payload(n))
                 .unwrap_or(false);
 
-            // px/módulo esperado del encuadre, no del detectado: si no se
-            // detecta nada no hay geometría de la que leerlo.
-            let lado = (w.min(h) as f32) * fill;
-            let ppm = lado * (modulos / (modulos + 8.0)) / modulos;
+            // Pixels per module expected from the framing, not from the detected
+            // geometry: if nothing is detected there is no geometry to read it
+            // from.
+            let side = (w.min(h) as f32) * fill;
+            let ppm = side * (modules / (modules + 8.0)) / modules;
 
             let bin = ((ppm - 2.0) / 0.5).floor();
             if (0.0..20.0).contains(&bin) {
                 let b = bin as usize;
                 total[b] += 1;
-                if leido {
+                if read {
                     ok[b] += 1;
                 }
             }
         }
     }
 
-    println!("px/mod    leidos/total   tasa");
+    println!("px/module   read/total    rate");
     for b in 0..20 {
         if total[b] == 0 {
             continue;
         }
         let lo = 2.0 + b as f32 * 0.5;
         println!(
-            "{lo:4.1}-{:4.1}  {:5}/{:<5}   {:5.1}%",
+            "{lo:4.1}-{:4.1}   {:5}/{:<5}   {:5.1}%",
             lo + 0.5,
             ok[b],
             total[b],

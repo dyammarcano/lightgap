@@ -1,55 +1,56 @@
-//! Cámara sintética: convierte una matriz de módulos en el frame borroso,
-//! torcido y ruidoso que de verdad captura una webcam apuntando a una pantalla.
+//! Synthetic camera: turns a module matrix into the blurry, skewed, noisy frame
+//! a webcam actually captures when pointed at a display.
 //!
-//! Sin esto, probar el canal visual exige dos portátiles, una habitación y un
-//! par de manos. Con esto cabe en un test que corre en CI, y además se puede
-//! barrer el espacio de condiciones —enfoque, ángulo, distancia, luz— de forma
-//! sistemática, que a mano no se hace nunca.
+//! Without it, testing the visual channel requires two laptops, a room and a
+//! pair of hands. With it, the whole thing fits in a test that runs in CI — and
+//! the space of conditions (focus, angle, distance, light) can be swept
+//! systematically, which never happens by hand.
 //!
-//! Lo que se modela, y por qué cada cosa:
+//! What is modelled, and why each piece:
 //!
-//! - **Perspectiva.** Dos pantallas nunca quedan perfectamente enfrentadas.
-//! - **Desenfoque.** El autofoco de una webcam caza, y a poca distancia falla.
-//! - **Ruido.** Con poca luz el sensor sube ganancia y ensucia.
-//! - **Contraste.** El brillo de la pantalla contra la exposición de la cámara;
-//!   un negro que llega a gris medio arruina el umbralizado.
-//! - **Moiré.** La rejilla de píxeles de la pantalla contra la del sensor. Es el
-//!   artefacto propio de este medio y no aparece fotografiando papel.
+//! - **Perspective.** Two displays are never perfectly square to each other.
+//! - **Blur.** A webcam's autofocus hunts, and fails at close range.
+//! - **Noise.** In low light the sensor raises gain and gets dirty.
+//! - **Contrast.** Display brightness against camera exposure; a black that
+//!   arrives as mid grey ruins thresholding.
+//! - **Moiré.** The display's pixel grid beating against the sensor's. It is the
+//!   artefact specific to this medium and does not appear when photographing
+//!   paper.
 
 use crate::encode::Modules;
 
-/// Módulos de zona de silencio alrededor del código. Cuatro es el mínimo del
-/// estándar; con menos, el detector no distingue dónde empieza el código.
+/// Quiet-zone modules around the code. Four is the standard's minimum; with less
+/// the detector cannot tell where the code begins.
 const QUIET_MODULES: usize = 4;
 
-/// Condiciones de captura.
+/// Capture conditions.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Conditions {
-    /// Tamaño del frame de cámara.
+    /// Camera frame size.
     pub frame_w: usize,
     pub frame_h: usize,
-    /// Fracción del lado menor del frame que ocupa el código, en 0..=1.
+    /// Fraction of the frame's shorter side the code occupies, in 0..=1.
     pub fill: f32,
-    /// Desplazamiento del centro, en fracción de la mitad del frame.
+    /// Centre displacement, as a fraction of half the frame.
     pub offset_x: f32,
     pub offset_y: f32,
-    /// Giro en grados.
+    /// Rotation in degrees.
     pub rotation_deg: f32,
-    /// Inclinación horizontal y vertical, en 0..=1. Cero es de frente.
+    /// Horizontal and vertical tilt, in 0..=1. Zero is head-on.
     pub tilt_x: f32,
     pub tilt_y: f32,
-    /// Radio del desenfoque gaussiano, en píxeles. Cero es enfoque perfecto.
+    /// Gaussian blur radius, in pixels. Zero is perfect focus.
     pub blur: f32,
-    /// Desviación típica del ruido, en niveles de gris.
+    /// Noise standard deviation, in grey levels.
     pub noise: f32,
-    /// Contraste en 0..=1: 1 conserva negro y blanco puros, valores menores los
-    /// acercan al gris.
+    /// Contrast in 0..=1: 1 preserves pure black and white, lower values pull
+    /// them toward grey.
     pub contrast: f32,
-    /// Brillo añadido, en niveles de gris, positivo o negativo.
+    /// Brightness offset, in grey levels, positive or negative.
     pub brightness: f32,
-    /// Intensidad del moiré, en 0..=1.
+    /// Moiré strength, in 0..=1.
     pub moire: f32,
-    /// Semilla del ruido, para que un fallo se reproduzca exacto.
+    /// Noise seed, so a failure reproduces exactly.
     pub seed: u64,
 }
 
@@ -75,18 +76,18 @@ impl Default for Conditions {
 }
 
 impl Conditions {
-    /// Captura ideal: de frente, enfocada, sin ruido. El caso de control.
+    /// Ideal capture: head-on, focused, noise-free. The control case.
     #[must_use]
     pub fn ideal() -> Self {
         Self::default()
     }
 
-    /// Una webcam decente sobre una mesa: algo de inclinación, enfoque
-    /// imperfecto y ruido leve, con el código bien encuadrado.
+    /// A decent webcam on a desk: some tilt, imperfect focus and light noise,
+    /// with the code well framed.
     ///
-    /// El desenfoque va en relación con el tamaño de módulo, no en absoluto: un
-    /// radio de 1,2 px es inofensivo sobre módulos de 8 px y devastador sobre
-    /// módulos de 3. Estos valores suponen un encuadre que respeta
+    /// Blur is relative to module size, not absolute: a 1.2 px radius is
+    /// harmless over 8 px modules and devastating over 3 px ones. These values
+    /// assume a framing that respects
     /// [`crate::geometry::MIN_PIXELS_PER_MODULE`].
     #[must_use]
     pub fn typical() -> Self {
@@ -103,8 +104,8 @@ impl Conditions {
         }
     }
 
-    /// Condiciones malas pero todavía plausibles: mano temblorosa, poca luz,
-    /// pantallas mal enfrentadas.
+    /// Bad but still plausible conditions: unsteady hands, poor light, displays
+    /// badly squared to each other.
     #[must_use]
     pub fn harsh() -> Self {
         Self {
@@ -123,8 +124,8 @@ impl Conditions {
     }
 }
 
-/// Generador de ruido reproducible. No hace falta calidad criptográfica, sí
-/// que la misma semilla dé siempre la misma imagen.
+/// Reproducible noise generator. Cryptographic quality is not needed; producing
+/// the same image from the same seed is.
 struct Noise(u64);
 
 impl Noise {
@@ -135,9 +136,9 @@ impl Noise {
         (self.0 >> 32) as u32
     }
 
-    /// Aproximación gaussiana sumando uniformes: por el teorema central del
-    /// límite, doce uniformes menos seis dan media 0 y varianza 1. Es el truco
-    /// clásico y sobra para ensuciar una imagen.
+    /// Gaussian approximation by summing uniforms: by the central limit theorem,
+    /// twelve uniforms minus six give mean 0 and variance 1. The classic trick,
+    /// and plenty for dirtying an image.
     fn gaussian(&mut self) -> f32 {
         let mut acc = 0.0f32;
         for _ in 0..12 {
@@ -147,13 +148,13 @@ impl Noise {
     }
 }
 
-/// Matriz de 3×3 en orden por filas.
+/// A 3x3 matrix in row-major order.
 type Mat3 = [f32; 9];
 
-/// Homografía del cuadrado unidad al cuadrilátero dado.
+/// Homography from the unit square to the given quadrilateral.
 ///
-/// Es la construcción clásica de Heckbert. El caso afín se trata aparte porque
-/// el general divide por un determinante que allí se anula.
+/// The classic Heckbert construction. The affine case is handled separately
+/// because the general one divides by a determinant that vanishes there.
 fn unit_square_to_quad(q: [(f32, f32); 4]) -> Mat3 {
     let (x0, y0) = q[0];
     let (x1, y1) = q[1];
@@ -173,7 +174,8 @@ fn unit_square_to_quad(q: [(f32, f32); 4]) -> Mat3 {
     let dy2 = y3 - y2;
     let den = dx1 * dy2 - dx2 * dy1;
     if den.abs() < 1e-9 {
-        // Cuadrilátero degenerado: se cae al afín antes que producir infinitos.
+        // Degenerate quadrilateral: fall back to affine rather than produce
+        // infinities.
         return [x1 - x0, x2 - x1, x0, y1 - y0, y2 - y1, y0, 0.0, 0.0, 1.0];
     }
 
@@ -224,8 +226,8 @@ fn apply(m: &Mat3, x: f32, y: f32) -> (f32, f32) {
     )
 }
 
-/// Muestreo bilineal, para que el remuestreo no añada escalones que el detector
-/// confundiría con módulos.
+/// Bilinear sampling, so resampling does not add steps the detector would
+/// mistake for modules.
 fn sample(src: &[u8], w: usize, h: usize, x: f32, y: f32) -> f32 {
     if x < 0.0 || y < 0.0 || x > (w - 1) as f32 || y > (h - 1) as f32 {
         return 255.0;
@@ -247,8 +249,9 @@ fn sample(src: &[u8], w: usize, h: usize, x: f32, y: f32) -> f32 {
     top + (bot - top) * fy
 }
 
-/// Desenfoque gaussiano separable. Dos pasadas de una dimensión en vez de una
-/// de dos: mismo resultado, coste lineal en el radio en vez de cuadrático.
+/// Separable Gaussian blur. Two one-dimensional passes instead of one
+/// two-dimensional pass: same result, cost linear in the radius rather than
+/// quadratic.
 fn blur(buf: &mut [f32], w: usize, h: usize, sigma: f32) {
     if sigma <= 0.0 {
         return;
@@ -260,9 +263,9 @@ fn blur(buf: &mut [f32], w: usize, h: usize, sigma: f32) {
             (-(x * x) / (2.0 * sigma * sigma)).exp()
         })
         .collect();
-    let suma: f32 = kernel.iter().sum();
+    let sum: f32 = kernel.iter().sum();
     for k in &mut kernel {
-        *k /= suma;
+        *k /= sum;
     }
 
     let mut tmp = vec![0.0f32; buf.len()];
@@ -288,42 +291,44 @@ fn blur(buf: &mut [f32], w: usize, h: usize, sigma: f32) {
     }
 }
 
-/// Captura sintética: matriz de módulos → frame de cámara en escala de grises.
+/// Synthetic capture: module matrix to greyscale camera frame.
 ///
-/// Devuelve `(ancho, alto, píxeles)`.
+/// Returns `(width, height, pixels)`.
 #[must_use]
 pub fn capture(modules: &Modules, cond: &Conditions) -> (usize, usize, Vec<u8>) {
     let (fw, fh) = (cond.frame_w, cond.frame_h);
-    let lado = (fw.min(fh) as f32) * cond.fill.clamp(0.05, 1.0);
+    let side = (fw.min(fh) as f32) * cond.fill.clamp(0.05, 1.0);
 
-    // La resolución de rasterizado se ajusta al tamaño que va a ocupar en el
-    // frame, en vez de fijarla alta y reducir mucho después.
+    // The raster resolution is matched to the size the code will occupy in the
+    // frame, rather than fixed high and shrunk afterwards.
     //
-    // Reducir mucho es justo lo que produce aliasing, y el aliasing tiene una
-    // firma engañosa: el código falla con enfoque perfecto y se lee al
-    // desenfocar, porque el desenfoque actúa de filtro antialias. Eso llevaría
-    // a concluir que el enlace mejora al desenfocar — al revés de la realidad.
-    // Manteniendo la fuente cerca del destino, el supermuestreo de abajo basta.
-    let modulos_totales = (modules.size() + QUIET_MODULES * 2) as f32;
-    let escala = ((2.5 * lado / modulos_totales).ceil() as usize).clamp(2, 12);
-    let (sw, sh, src) = modules.render_greyscale(escala, QUIET_MODULES);
+    // Shrinking a lot is exactly what produces aliasing, and aliasing has a
+    // deceptive signature: the code fails at perfect focus and reads once
+    // blurred, because blur acts as an anti-alias filter. That would lead to
+    // concluding the link improves when defocused — the opposite of reality.
+    // Keeping the source close to the destination lets the supersampling below
+    // suffice.
+    let total_modules = (modules.size() + QUIET_MODULES * 2) as f32;
+    let scale = ((2.5 * side / total_modules).ceil() as usize).clamp(2, 12);
+    let (sw, sh, src) = modules.render_greyscale(scale, QUIET_MODULES);
+
     let cx = fw as f32 / 2.0 + cond.offset_x * fw as f32 / 2.0;
     let cy = fh as f32 / 2.0 + cond.offset_y * fh as f32 / 2.0;
 
-    // Cuadrado centrado, girado y luego inclinado. La inclinación se aplica
-    // acercando dos esquinas: es lo que hace una pantalla vista en escorzo.
-    let r = lado / 2.0;
+    // A centred square, rotated and then tilted. Tilt is applied by pulling two
+    // corners in: that is what a display seen at an angle does.
+    let r = side / 2.0;
     let rot = cond.rotation_deg.to_radians();
     let (sin, cos) = rot.sin_cos();
-    let girar = |dx: f32, dy: f32| (cx + dx * cos - dy * sin, cy + dx * sin + dy * cos);
+    let rotate = |dx: f32, dy: f32| (cx + dx * cos - dy * sin, cy + dx * sin + dy * cos);
 
     let tx = cond.tilt_x.clamp(0.0, 0.9);
     let ty = cond.tilt_y.clamp(0.0, 0.9);
     let quad = [
-        girar(-r, -r),
-        girar(r * (1.0 - tx), -r * (1.0 - ty)),
-        girar(r, r),
-        girar(-r * (1.0 - tx), r * (1.0 - ty)),
+        rotate(-r, -r),
+        rotate(r * (1.0 - tx), -r * (1.0 - ty)),
+        rotate(r, r),
+        rotate(-r * (1.0 - tx), r * (1.0 - ty)),
     ];
 
     let m = unit_square_to_quad(quad);
@@ -331,23 +336,21 @@ pub fn capture(modules: &Modules, cond: &Conditions) -> (usize, usize, Vec<u8>) 
         return (fw, fh, vec![255u8; fw * fh]);
     };
 
-    // Fondo claro: una pantalla encendida en una habitación normal no está
-    // rodeada de negro.
+    // A light background: a lit display in an ordinary room is not surrounded by
+    // black.
     let mut buf = vec![235.0f32; fw * fh];
 
-    // Supermuestreo: cada píxel de destino promedia SS×SS muestras repartidas
-    // por su área.
+    // Supersampling: each destination pixel averages SS x SS samples spread over
+    // its area.
     //
-    // No es un lujo. Un sensor real INTEGRA sobre el área del píxel; muestrear
-    // por puntos produce aliasing al reducir, y el aliasing tiene una firma
-    // muy engañosa: el código falla sin desenfoque y se lee con él, porque el
-    // desenfoque hace de filtro antialias. Eso llevaría a concluir que el
-    // enlace mejora al desenfocar, que es exactamente al revés de la realidad.
+    // Not a luxury. A real sensor INTEGRATES over the pixel's area; point
+    // sampling produces aliasing when shrinking, with the deceptive signature
+    // described above.
     const SS: usize = 3;
 
-    // Solo se recorre la caja que ocupa el cuadrilátero: el resto del frame es
-    // fondo y supermuestrearlo es trabajo tirado. En un encuadre típico eso es
-    // un tercio de los píxeles.
+    // Only the quadrilateral's bounding box is walked: the rest of the frame is
+    // background and supersampling it is wasted work. In a typical framing that
+    // is a third of the pixels.
     let xs = quad.map(|p| p.0);
     let ys = quad.map(|p| p.1);
     let bx0 = xs
@@ -368,13 +371,13 @@ pub fn capture(modules: &Modules, cond: &Conditions) -> (usize, usize, Vec<u8>) 
     for py in by0..by1 {
         for px in bx0..bx1 {
             let mut acc = 0.0f32;
-            let mut dentro = 0u32;
+            let mut inside = 0u32;
             for sy in 0..SS {
                 for sx in 0..SS {
-                    // Centros de SS×SS subceldas que cubren el píxel ENTERO.
-                    // Con `1/(SS+1)` las muestras se apiñan en la mitad central
-                    // y dejan sin cubrir la huella real del píxel, que es lo que
-                    // el sensor integra.
+                    // Centres of SS x SS subcells covering the WHOLE pixel. With
+                    // `1/(SS+1)` the samples bunch up in the middle and leave the
+                    // pixel's real footprint — what the sensor integrates —
+                    // uncovered.
                     let fx = px as f32 + (sx as f32 + 0.5) / SS as f32;
                     let fy = py as f32 + (sy as f32 + 0.5) / SS as f32;
                     let (u, v) = apply(&inv, fx, fy);
@@ -382,29 +385,29 @@ pub fn capture(modules: &Modules, cond: &Conditions) -> (usize, usize, Vec<u8>) 
                         continue;
                     }
                     acc += sample(&src, sw, sh, u * (sw - 1) as f32, v * (sh - 1) as f32);
-                    dentro += 1;
+                    inside += 1;
                 }
             }
-            if dentro == 0 {
+            if inside == 0 {
                 continue;
             }
-            // Las muestras que caen fuera del código aportan fondo, para que el
-            // borde quede suavizado en vez de escalonado.
+            // Samples landing outside the code contribute background, so the
+            // edge comes out smooth rather than stepped.
             let total = (SS * SS) as f32;
-            let fuera = total - dentro as f32;
-            buf[py * fw + px] = (acc + fuera * 235.0) / total;
+            let outside = total - inside as f32;
+            buf[py * fw + px] = (acc + outside * 235.0) / total;
         }
     }
 
-    // El moiré nace del batido entre la rejilla de la pantalla y la del sensor,
-    // así que se modela como una modulación de frecuencia cercana al paso de
-    // píxel, no como ruido suelto.
+    // Moiré arises from the beat between the display grid and the sensor grid,
+    // so it is modelled as a modulation near the pixel pitch rather than as
+    // loose noise.
     if cond.moire > 0.0 {
         let amp = cond.moire.clamp(0.0, 1.0) * 40.0;
         for py in 0..fh {
             for px in 0..fw {
-                let onda = ((px as f32 * 0.83).sin() * (py as f32 * 0.79).sin()) * amp;
-                buf[py * fw + px] += onda;
+                let wave = ((px as f32 * 0.83).sin() * (py as f32 * 0.79).sin()) * amp;
+                buf[py * fw + px] += wave;
             }
         }
     }
@@ -412,12 +415,12 @@ pub fn capture(modules: &Modules, cond: &Conditions) -> (usize, usize, Vec<u8>) 
     blur(&mut buf, fw, fh, cond.blur);
 
     let mut rng = Noise(cond.seed | 1);
-    let contraste = cond.contrast.clamp(0.05, 2.0);
+    let contrast = cond.contrast.clamp(0.05, 2.0);
     let mut out = vec![0u8; fw * fh];
     for (i, v) in buf.iter().enumerate() {
-        // El contraste se aplica alrededor del gris medio, que es donde queda
-        // el umbral de decisión del detector.
-        let mut p = (v - 128.0) * contraste + 128.0 + cond.brightness;
+        // Contrast is applied around mid grey, which is where the detector's
+        // decision threshold sits.
+        let mut p = (v - 128.0) * contrast + 128.0 + cond.brightness;
         if cond.noise > 0.0 {
             p += rng.gaussian() * cond.noise;
         }

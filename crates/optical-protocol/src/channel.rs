@@ -1,37 +1,37 @@
-//! Abstracción del medio físico.
+//! Abstraction over the physical medium.
 //!
-//! Un canal transporta **marcos de bytes**, no PDUs. Un QR entrega exactamente
-//! los bytes que se codificaron; interpretarlos es trabajo de [`crate::wire`].
-//! Si el canal supiera de PDUs, la abstracción tendría una fuga justo por donde
-//! después entra el canal acústico —que empaqueta de otra forma— y por donde
-//! entraría un socket TCP, que ni siquiera tiene marcos.
+//! A channel carries **byte frames, not PDUs**. A QR code hands back exactly
+//! the bytes that were encoded; interpreting them is [`crate::wire`]'s job. If
+//! the channel knew about PDUs the abstraction would leak precisely where the
+//! acoustic channel later plugs in — it frames differently — and where a TCP
+//! socket would, since it has no frames at all.
 //!
-//! Los canales tampoco deciden *qué* se envía. Eso lo hace el multiplexor de la
-//! Fase 6, mirando [`ChannelHealth`] en vivo.
+//! Channels also do not decide *what* gets sent. That is the multiplexer's job,
+//! looking at live [`ChannelHealth`].
 
 use core::fmt;
 use core::time::Duration;
 
-/// Qué medio físico es. Se usa para enrutar por clase de prioridad y para que
-/// la telemetría distinga de dónde vienen los números.
+/// Which physical medium this is. Used to route by priority class and to let
+/// telemetry say where each number came from.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ChannelId {
-    /// Pantalla ⇄ cámara.
+    /// Display to camera.
     Visual,
-    /// Altavoz ⇄ micrófono.
+    /// Speaker to microphone.
     Acoustic,
-    /// Dos instancias en la misma máquina, para probar el protocolo sin
-    /// hardware óptico.
+    /// Two instances on the same machine, to exercise the protocol without
+    /// optical hardware.
     Loopback,
-    /// Enlace simulado en memoria, solo en tests.
+    /// In-memory simulated link, tests only.
     Simulated,
 }
 
-/// En qué sentidos sirve el canal.
+/// Which directions the channel serves.
 ///
-/// La asimetría no es hipotética: la calibración puede concluir que el audio
-/// funciona de A a B pero no al revés, porque los micrófonos y altavoces de
-/// las dos máquinas no tienen por qué parecerse.
+/// The asymmetry is not hypothetical: calibration may conclude that audio works
+/// from A to B but not the other way, because the two machines' microphones and
+/// speakers have no reason to resemble each other.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Direction {
     TxOnly,
@@ -51,53 +51,54 @@ impl Direction {
     }
 }
 
-/// Lo que el canal promete. Se fija al negociar el perfil y cambia solo con una
-/// recalibración.
+/// What the channel promises. Fixed when the profile is negotiated, and only
+/// changed by a recalibration.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct ChannelCaps {
     pub id: ChannelId,
-    /// Bytes útiles por marco. Es el techo del tamaño de PDU en este canal.
+    /// Usable bytes per frame. This is the ceiling on PDU size for this channel.
     pub mtu: usize,
     pub direction: Direction,
-    /// Rendimiento nominal del perfil negociado, para que el multiplexor pueda
-    /// repartir sin medir de nuevo.
+    /// Nominal throughput of the negotiated profile, so the multiplexer can
+    /// apportion without measuring again.
     pub nominal_bps: u64,
-    /// Retardo típico de un marco de extremo a extremo.
+    /// Typical end-to-end delay of one frame.
     pub nominal_latency: Duration,
 }
 
-/// Cómo va el canal *ahora*. Es lo que mira el multiplexor para degradar.
+/// How the channel is doing *right now*. This is what the multiplexer watches
+/// in order to degrade.
 #[derive(Debug, Clone, Copy, PartialEq, Default)]
 pub struct ChannelHealth {
     pub frames_sent: u64,
     pub frames_received: u64,
-    /// Marcos que llegaron pero no pasaron validación.
+    /// Frames that arrived but failed validation.
     ///
-    /// Es un subconjunto de `frames_received`: todo marco recogido cuenta como
-    /// recibido, y además como rechazado si resultó inválido. Separarlos de los
-    /// perdidos es deliberado: perder marcos indica encuadre o ruido, recibirlos
-    /// corruptos indica que el perfil es demasiado agresivo. Piden arreglos
-    /// distintos.
+    /// A subset of `frames_received`: every collected frame counts as received,
+    /// and additionally as rejected if it turned out invalid. Keeping these
+    /// separate from lost frames is deliberate — losing frames points at framing
+    /// or noise, receiving corrupt ones points at an over-aggressive profile.
+    /// They call for different fixes.
     pub frames_rejected: u64,
-    /// Cuándo llegó el último marco válido, en tiempo de sesión.
+    /// When the last valid frame arrived, in session time.
     ///
-    /// Tiempo de sesión y no `Instant` porque el núcleo es sans-io: quien manda
-    /// el reloj es quien llama, y en tests ese reloj es virtual para que una
-    /// transferencia de 5 MB no tarde 5 MB de segundos.
+    /// Session time rather than `Instant` because the core is sans-io: the
+    /// caller owns the clock, and in tests that clock is virtual so a 5 MB
+    /// transfer does not take 5 MB worth of seconds.
     pub last_rx: Option<Duration>,
 }
 
 impl ChannelHealth {
-    /// Proporción de marcos recibidos que hubo que descartar, en 0..=1.
+    /// Fraction of received frames that had to be discarded, in 0..=1.
     ///
-    /// El divisor es `frames_received` a secas, porque los rechazados ya están
-    /// contados ahí. Sumarlos aparte los contaría dos veces y un canal 100 %
-    /// basura reportaría 0,5 — suficiente para que el multiplexor de la Fase 6
-    /// lo siguiera usando.
+    /// The divisor is `frames_received` alone, because rejected frames are
+    /// already counted there. Adding them separately would double-count them and
+    /// a channel producing nothing but garbage would report 0.5 — enough for the
+    /// multiplexer to keep using it.
     ///
-    /// Devuelve 0 sin nada recibido: un canal del que aún no se sabe nada no es
-    /// un canal malo, y tratarlo como tal haría que el multiplexor lo
-    /// descartara antes de darle una oportunidad.
+    /// Returns 0 with nothing received: a channel nothing is known about yet is
+    /// not a bad channel, and treating it as one would have the multiplexer
+    /// discard it before giving it a chance.
     #[must_use]
     pub fn rejection_rate(&self) -> f32 {
         if self.frames_received == 0 {
@@ -107,44 +108,44 @@ impl ChannelHealth {
     }
 }
 
-/// Por qué no se pudo entregar un marco al medio.
+/// Why a frame could not be handed to the medium.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum ChannelError {
-    #[error("marco de {got} B supera la MTU de {mtu} B del canal")]
+    #[error("frame of {got} B exceeds the channel MTU of {mtu} B")]
     OverMtu { got: usize, mtu: usize },
 
-    #[error("el canal no transmite en este sentido")]
+    #[error("the channel does not transmit in this direction")]
     NotTransmitting,
 
-    #[error("el canal está caído")]
+    #[error("the channel is down")]
     Down,
 
-    #[error("la cola de salida está llena")]
+    #[error("the outbound queue is full")]
     Backpressure,
 }
 
-/// Un medio por el que viajan marcos.
+/// A medium that frames travel over.
 ///
-/// Deliberadamente no async: el núcleo es sans-io y no debe elegir runtime. Los
-/// drivers reales (cámara, audio) corren en sus propias tasks y alimentan una
-/// implementación de este trait por cola.
+/// Deliberately not async: the core is sans-io and must not pick a runtime. Real
+/// drivers (camera, audio) run in their own tasks and feed an implementation of
+/// this trait through a queue.
 pub trait Channel {
     fn caps(&self) -> ChannelCaps;
 
     fn health(&self) -> ChannelHealth;
 
-    /// Encola un marco ya serializado.
+    /// Queues an already-serialized frame.
     ///
-    /// Que devuelva `Ok` significa aceptado para transmisión, no entregado. En
-    /// un canal óptico no existe la confirmación a este nivel: eso lo resuelve
-    /// la capa de fiabilidad.
+    /// `Ok` means accepted for transmission, not delivered. An optical channel
+    /// has no acknowledgement at this level; that is the reliability layer's
+    /// problem.
     fn send_frame(&mut self, frame: &[u8]) -> Result<(), ChannelError>;
 
-    /// Recoge el siguiente marco recibido, si lo hay. No bloquea.
+    /// Collects the next received frame, if any. Never blocks.
     fn recv_frame(&mut self) -> Option<Vec<u8>>;
 
-    /// Avisa del paso del tiempo. Los canales con retardo modelado lo necesitan
-    /// para decidir qué marcos ya deberían haber llegado.
+    /// Reports the passage of time. Channels that model delay need it in order
+    /// to decide which frames should have arrived by now.
     fn advance(&mut self, _now: Duration) {}
 }
 
@@ -152,9 +153,9 @@ impl fmt::Display for ChannelId {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let s = match self {
             Self::Visual => "visual",
-            Self::Acoustic => "acústico",
+            Self::Acoustic => "acoustic",
             Self::Loopback => "loopback",
-            Self::Simulated => "simulado",
+            Self::Simulated => "simulated",
         };
         f.write_str(s)
     }
