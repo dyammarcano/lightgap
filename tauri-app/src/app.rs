@@ -834,7 +834,22 @@ pub fn App() -> impl IntoView {
                 // Saturated. Nothing in the bright part of this frame can be
                 // told apart, which is exactly where the code is.
                 (level - EXPOSURE_STEP).max(0.0)
+            } else if s.pixels_per_module > 0.0 {
+                // A code is being resolved at a usable size and still not read.
+                // With nothing clipped, what is left is time: the exposure is
+                // long enough to smear a display that changes several times a
+                // second, and the modules blur into each other while every
+                // static measure of the picture looks healthy.
+                (level - EXPOSURE_STEP).max(0.0)
             } else if frame_mean.get_untracked() < DARK_MEAN {
+                // Nothing found at all and a dark frame. Only here is more
+                // light the answer.
+                //
+                // This used to be the first thing checked, which was wrong in
+                // the case that matters: the subject is a lit screen in an
+                // unlit room, so the frame mean is low even when the screen is
+                // exposed perfectly, and metering on it drives the exposure up
+                // until the code smears.
                 (level + EXPOSURE_STEP).min(1.0)
             } else {
                 continue;

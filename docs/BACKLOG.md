@@ -92,6 +92,29 @@ Cosmetic — the content is correct and the file log is unaffected — but it do
 the length of every capture and would be worth ten minutes with only one target
 registered to find.
 
+## The desktop direction reads one frame in ten
+
+Measured on a laptop webcam looking at a tablet across a desk, after the
+resolution, brightness and exposure calibration all settled: 9.8 pixels per
+module — comfortably above the 8.5 threshold — and a 9% read rate, with nothing
+clipped and nothing counted as seen-but-unread. The other direction, a tablet
+camera looking at a monitor, reads 90% of the time.
+
+Good density with bad decodes and no clipping points at time rather than light:
+a display that changes every 80 ms smeared across an exposure long enough to
+span more than one of them. Shortening the exposure when a code is resolved but
+unread was tried and did not visibly move the figure, which weakens that
+explanation without replacing it.
+
+What has not been tried: holding each code longer specifically for a peer that
+reports reading badly (the hold is one number for both directions today);
+autofocus, which is not touched at all and which a screen at close range defeats
+routinely; and simply measuring at several distances, which would separate a
+focus explanation from a framing one in about ten minutes.
+
+It is the one thing standing between this and a completed transfer over real
+hardware. Everything above it in the stack has been measured working.
+
 ## A licence
 
 The repository is public with no `LICENSE` file, which means all rights
