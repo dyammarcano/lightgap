@@ -42,12 +42,18 @@ const CAPTURE_H: u32 = 1080;
 
 /// Pixel budget for the wide search, when there is no code to track.
 ///
-/// It cannot go much below this. The search has to succeed at least once before
-/// tracking has anything to track, and a code that fills half the frame at
-/// 1280 wide resolves about seven pixels per module — already under what reads
-/// reliably. Searching cheaper would be searching for something that can never
-/// be found.
-const SEARCH_BUDGET_PX: f64 = 1_300_000.0;
+/// About a 1280x720 frame, which is what this link is measured to acquire at:
+/// a code filling half the frame resolves roughly seven pixels per module there
+/// and does get read. It cannot go far below that — the search must succeed
+/// once before tracking has anything to track, and searching cheaper would be
+/// searching for something that can never be found.
+///
+/// Nor should it go far above. Raising it to 1.3 megapixels, to match what the
+/// camera was newly being asked for, took the search from about 130 ms a frame
+/// to 285 ms and bought nothing: acquisition already worked at the lower
+/// figure. The extra resolution is worth paying for only once there is a region
+/// to spend it on, which is what the tracking budget below is for.
+const SEARCH_BUDGET_PX: f64 = 950_000.0;
 
 /// Pixel budget once a code is being tracked.
 ///
@@ -125,19 +131,22 @@ fn spaced(digits: &str) -> String {
 /// never sits visibly wrong, not that it is precise.
 const CLOCK_INTERVAL_MS: u32 = 10_000;
 
-/// How long the peer may fail to see us before the transmitter is turned up.
+/// How often the transmitter is reconsidered while calibrating down.
 ///
-/// Not instant. Discovery is not symmetric in time — one side always reads the
-/// other first — and reacting to that ordinary gap would drive the brightness
-/// up during every normal handshake.
-const UNSEEN_GRACE_MS: u32 = 2_500;
+/// Slower than the status poll, and far slower than the frame rate. Each step
+/// has to survive long enough for the peer to measure it and say so, and its
+/// report only refreshes when its own window closes. Stepping faster would be
+/// stepping on evidence that had not arrived yet.
+const CALIBRATE_INTERVAL_MS: u32 = 2_000;
 
-/// How much of the remaining range one step closes.
-///
-/// Multiplicative, so it moves quickly while the link is badly wrong and
-/// settles as it approaches full output, rather than stepping past the point
-/// where it started working.
-const BOOST_STEP: f32 = 0.35;
+/// How much output one step gives up.
+const DESCEND_STEP: f32 = 0.06;
+
+/// The peer must be reading this well before anything is given up.
+const DESCEND_ABOVE: f32 = 0.90;
+
+/// Below this, the last step went too far and is taken back.
+const RECOVER_BELOW: f32 = 0.75;
 
 /// How often the battery is re-read.
 const BATTERY_INTERVAL_MS: u32 = 60_000;
@@ -382,6 +391,7 @@ struct Status {
     payload_per_frame: usize,
     offered_bps: f32,
     delivered_bps: f32,
+    peer_read_quality: Option<f32>,
     sas: Option<String>,
     pairing_expires_in: Option<u64>,
     metrics: Metrics,
@@ -557,17 +567,19 @@ pub fn App() -> impl IntoView {
             .unwrap_or(false);
         set_dimmable.set(ok);
         if ok {
-            let level = recall(BRIGHTNESS_KEY)
-                .and_then(|v| v.parse::<f32>().ok())
-                .unwrap_or(1.0);
-            set_brightness.set(level);
-            apply_brightness(level);
+            // Always full, never the value this ran at last time.
+            //
+            // The link has to exist before anything about it can be measured,
+            // and the surest way to be seen is to be as bright as the hardware
+            // allows. Restoring a dim setting from a previous session means
+            // starting invisible and hoping to climb out of it — and if the
+            // peer starts dim too, neither can see the other to know that it
+            // should. Calibration goes the other way: begin somewhere known to
+            // work, then give output back while it still does.
+            set_brightness.set(1.0);
+            apply_brightness(1.0);
         }
     });
-
-    if let Some(level) = recall(CODE_LIGHT_KEY).and_then(|v| v.parse::<f32>().ok()) {
-        set_code_light.set(level.clamp(CODE_LIGHT_FLOOR, 1.0));
-    }
 
     let on_code_light = move |ev| {
         let raw = event_target_value(&ev);
@@ -591,50 +603,87 @@ pub fn App() -> impl IntoView {
     // The one closed loop in the interface, and it only ever acts on this end's
     // own transmitter.
     //
-    // The condition is deliberately narrow: we can see them and they cannot see
-    // us. That combination rules out the camera, the aim and the distance —
-    // all of which would break both directions — and leaves what this device is
-    // emitting. So it turns its own output up, and stops the moment it is seen.
+    // It descends. Full output is where every session begins, because a link
+    // that does not exist cannot be measured, and being as bright as the
+    // hardware allows is the surest way to be read. From there it gives output
+    // back one step at a time for as long as the peer keeps saying it is
+    // reading well, and takes the last step back when the peer says it is not.
     //
-    // It never turns anything down. Being unseen is evidence; being seen is not
-    // evidence that there was too much light, and a loop that hunted in both
-    // directions would oscillate around the threshold it just found.
+    // Climbing instead would mean spending the whole search invisible, and
+    // worse: the evidence that it should climb is the peer failing to see it,
+    // which is exactly the evidence that cannot arrive when both ends are dim.
+    // Two devices would sit facing each other in the dark, each waiting for the
+    // other to appear first.
+    //
+    // The peer's figure is the signal, never our own. Ours measures their
+    // display against our camera; theirs measures our display against their
+    // camera, and it is our display this loop is turning down.
     spawn_local(async move {
-        let mut unseen_for = 0u32;
+        let mut settled = false;
         loop {
-            gloo_timers::future::TimeoutFuture::new(STATUS_INTERVAL_MS).await;
+            gloo_timers::future::TimeoutFuture::new(CALIBRATE_INTERVAL_MS).await;
             let s = status.get_untracked();
 
-            if !s.sees_peer || s.peer_sees_us {
-                unseen_for = 0;
+            // Not linked: go back to what is known to work and start over.
+            if !(s.sees_peer && s.peer_sees_us) {
+                settled = false;
+                if code_light.get_untracked() < 1.0 {
+                    set_code_light.set(1.0);
+                }
+                if dimmable.get_untracked() && brightness.get_untracked() < 1.0 {
+                    set_brightness.set(1.0);
+                    apply_brightness(1.0);
+                }
                 continue;
             }
 
-            unseen_for += STATUS_INTERVAL_MS;
-            if unseen_for < UNSEEN_GRACE_MS {
-                continue;
-            }
-            unseen_for = 0;
-
-            // The mask first: it costs nothing and works on every platform.
-            let light = code_light.get_untracked();
-            if light < 1.0 {
-                let next = (light + (1.0 - light) * BOOST_STEP).min(1.0);
-                set_code_light.set(next);
-                remember(CODE_LIGHT_KEY, &next.to_string());
+            if settled {
                 continue;
             }
 
-            // Only then the backlight, which is a system setting and belongs to
-            // the user more than the mask does.
+            let Some(quality) = s.peer_read_quality else {
+                continue;
+            };
+
+            if quality < RECOVER_BELOW {
+                // One step too far. Give it back and stop, rather than hunting
+                // across the threshold that was just found.
+                let light = code_light.get_untracked();
+                if light < 1.0 {
+                    set_code_light.set((light + DESCEND_STEP).min(1.0));
+                } else if dimmable.get_untracked() {
+                    let level = brightness.get_untracked();
+                    set_brightness.set((level + DESCEND_STEP).min(1.0));
+                    apply_brightness((level + DESCEND_STEP).min(1.0));
+                }
+                settled = true;
+                continue;
+            }
+
+            if quality < DESCEND_ABOVE {
+                // Working, but not with enough margin to spend.
+                continue;
+            }
+
+            // The backlight first where it exists: it lowers the light and the
+            // dark together and so keeps the contrast ratio, which the mask
+            // cannot. The mask is what is left once there is no backlight to
+            // give back.
             if dimmable.get_untracked() {
                 let level = brightness.get_untracked();
-                if level < 1.0 {
-                    let next = (level + (1.0 - level) * BOOST_STEP).min(1.0);
+                if level > DESCEND_STEP {
+                    let next = level - DESCEND_STEP;
                     set_brightness.set(next);
-                    remember(BRIGHTNESS_KEY, &next.to_string());
                     apply_brightness(next);
+                    continue;
                 }
+            }
+
+            let light = code_light.get_untracked();
+            if light - DESCEND_STEP > CODE_LIGHT_SAFE {
+                set_code_light.set(light - DESCEND_STEP);
+            } else {
+                settled = true;
             }
         }
     });
@@ -1135,7 +1184,16 @@ pub fn App() -> impl IntoView {
                                    landscape:w-[min(100%,74vh)]"
                         >
                             <div
-                                class="absolute inset-0 rounded-xl bg-white p-2 sm:p-3 \
+                                // No padding. The encoded image already carries
+                                // its own quiet zone — four modules a side, with
+                                // the white to draw them — so a margin here was
+                                // a second one stacked on the first, and every
+                                // pixel of it was area the code could not use.
+                                // On this link that is not tidiness: the code
+                                // shrinks, its modules land on fewer of the
+                                // peer's sensor pixels, and the read rate falls
+                                // for no reason at all.
+                                class="absolute inset-0 rounded-xl bg-white \
                                        [&>svg]:block [&>svg]:h-full [&>svg]:w-full"
                                 inner_html=move || qr.get()
                             ></div>
@@ -1357,7 +1415,7 @@ pub fn App() -> impl IntoView {
                             <input
                                 class="mt-1 w-full accent-gold"
                                 type="range"
-                                min="0.08"
+                                min=CODE_LIGHT_FLOOR.to_string()
                                 max="1"
                                 step="0.01"
                                 prop:value=move || code_light.get().to_string()
@@ -1366,21 +1424,25 @@ pub fn App() -> impl IntoView {
                             <p
                                 class="mt-1 text-[0.7rem] text-dim/70"
                                 class=(
-                                    "text-gold",
+                                    "text-verified",
                                     move || {
                                         let s = status.get();
-                                        s.sees_peer && !s.peer_sees_us
+                                        s.sees_peer && s.peer_sees_us
                                     },
                                 )
                             >
                                 {move || {
                                     let s = status.get();
-                                    if s.sees_peer && !s.peer_sees_us {
-                                        "Turning up — they cannot see this screen yet"
-                                    } else if code_light.get() < CODE_LIGHT_SAFE {
-                                        "Below what usually decodes — watch the read rate"
-                                    } else {
-                                        "Lower it if the peer sees the code but cannot read it"
+                                    match s.peer_read_quality {
+                                        Some(q) if s.sees_peer && s.peer_sees_us => {
+                                            format!("Peer reads this screen at {:.0}%", q * 100.0)
+                                        }
+                                        _ if code_light.get() < CODE_LIGHT_SAFE => {
+                                            "Below what usually decodes — watch the read rate"
+                                                .to_owned()
+                                        }
+                                        _ => "Full while searching · settles once linked"
+                                            .to_owned(),
                                     }
                                 }}
                             </p>

@@ -492,3 +492,69 @@ fn losing_the_peer_withdraws_the_claim_that_it_can_see_us() {
         "a peer that has gone quiet is not a peer that can still see us"
     );
 }
+
+#[test]
+fn each_end_reports_how_well_it_reads_the_other() {
+    let mut a = Session::new(peer(1));
+    let mut b = Session::new(peer(9));
+
+    a.set_read_quality(0.8);
+    let hello_a = a.poll_transmit().expect("a announces");
+    b.handle_incoming(&hello_a);
+
+    let reported = b.peer_read_quality().expect("b was told");
+    assert!(
+        (reported - 0.8).abs() < 0.01,
+        "b should learn how well a is reading it, got {reported}"
+    );
+
+    // And it is the peer's number, not b's own. b has read nothing well or
+    // badly yet; what it now knows is a's opinion of b's display.
+    assert_eq!(
+        a.peer_read_quality(),
+        None,
+        "a has heard nothing back, and should not invent a figure"
+    );
+}
+
+#[test]
+fn a_peer_that_has_measured_nothing_is_not_a_peer_reading_at_zero() {
+    let mut a = Session::new(peer(1));
+    // b has just started: it has read nothing, well or badly.
+    let mut b = Session::new(peer(9));
+
+    b.handle_timeout(HELLO_INTERVAL);
+    a.handle_incoming(&b.poll_transmit().expect("b announces"));
+
+    assert_eq!(
+        a.peer_read_quality(),
+        None,
+        "silence is not a measurement of zero — and the peer acts on this by          shrinking what it transmits, so the two readings would send it in          opposite directions at the moment it can least afford it"
+    );
+
+    // Once b has actually measured badly, that *is* worth acting on.
+    b.set_read_quality(0.0);
+    b.handle_timeout(HELLO_INTERVAL * 2);
+    a.handle_incoming(&b.poll_transmit().expect("b announces again"));
+    assert_eq!(a.peer_read_quality(), Some(0.0));
+}
+
+#[test]
+fn the_reported_quality_is_forgotten_with_the_peer() {
+    let mut a = Session::new(peer(1));
+    let mut b = Session::new(peer(9));
+
+    b.set_read_quality(0.9);
+    b.handle_timeout(HELLO_INTERVAL);
+    a.handle_incoming(&b.poll_transmit().expect("b announces"));
+    assert!(a.peer_read_quality().is_some());
+
+    a.handle_timeout(HELLO_INTERVAL + PEER_TIMEOUT);
+    assert_eq!(
+        a.peer_read_quality(),
+        None,
+        "a figure from a peer that has gone is not a measurement of anything, \
+         and sizing the next transmission from it would size it for a link \
+         that no longer exists"
+    );
+}

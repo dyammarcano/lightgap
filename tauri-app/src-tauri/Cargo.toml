@@ -32,6 +32,7 @@ optical-codec = { path = "../../crates/optical-codec" }
 optical-protocol = { path = "../../crates/optical-protocol" }
 tauri-plugin-log = "2.9.0"
 log = "0.4.33"
+link-calibration = { version = "0.1.0", path = "../../crates/link-calibration" }
 
 # Desktop only. The crate is `#![cfg(not(android/ios))]` at its root, so on
 # mobile it compiles to nothing and any use of it fails to resolve — and a

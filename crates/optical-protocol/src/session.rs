@@ -110,8 +110,16 @@ pub const HELLO_INTERVAL: Duration = Duration::from_millis(500);
 /// the session collapsing constantly.
 pub const PEER_TIMEOUT: Duration = Duration::from_secs(5);
 
-/// Bytes in a `Hello` payload: peer identifier, then key material.
-pub const HELLO_LEN: usize = 16 + ANNOUNCEMENT_LEN;
+/// Bytes in a `Hello` payload: peer identifier, key material, then one byte
+/// saying how well this end is reading the other.
+///
+/// That last byte is what makes transmit sizing possible at all. How well I
+/// read your code says nothing about how well you read mine — different camera,
+/// different display, and the link is measured separately in each direction. So
+/// each end reports what it observes, and the *other* end is the one that acts
+/// on it. Without it, sizing would have to assume the two directions are alike,
+/// which is the one thing this design has said from the start that they are not.
+pub const HELLO_LEN: usize = 16 + ANNOUNCEMENT_LEN + 1;
 
 /// How long one pairing code stays valid before a fresh ephemeral key is drawn.
 ///
@@ -140,6 +148,10 @@ pub struct Session {
     /// the useful one: an optical link fails one direction at a time, and
     /// knowing which end is aimed wrong is most of knowing what to do about it.
     peer_sees_us: bool,
+    /// How well this end is reading the peer, as it will be reported to them.
+    read_quality: u8,
+    /// How well the peer says it is reading this end, if it has said.
+    peer_read_quality: Option<u8>,
     pairing: Pairing,
     pending: Option<Pdu>,
 }
@@ -158,6 +170,8 @@ impl Session {
             next_hello: Duration::ZERO,
             next_rotation: PAIRING_ROTATION,
             peer_sees_us: false,
+            read_quality: 0,
+            peer_read_quality: None,
             pairing: Pairing::new(),
             pending: None,
         }
@@ -187,6 +201,34 @@ impl Session {
     #[must_use]
     pub fn local(&self) -> PeerId {
         self.local
+    }
+
+    /// Records how well this end is reading the peer, for the peer to act on.
+    ///
+    /// Quantised to a byte because it rides in every announcement and this link
+    /// charges by the byte; a 1-in-254 resolution is far finer than the
+    /// measurement behind it deserves.
+    ///
+    /// Zero is reserved for "nothing measured yet" and the scale starts at one.
+    /// The distinction is not pedantic: a session that has just started has read
+    /// nothing, and a plain zero would be indistinguishable from having measured
+    /// carefully and found the peer unreadable. The peer acts on this figure by
+    /// shrinking what it transmits, so the two readings send it in opposite
+    /// directions at exactly the moment it can least afford it.
+    pub fn set_read_quality(&mut self, fraction: f32) {
+        self.read_quality = 1 + (fraction.clamp(0.0, 1.0) * 254.0).round() as u8;
+    }
+
+    /// How well the peer says it is reading this end.
+    ///
+    /// `None` until the peer has measured something. This, and not our own read
+    /// rate, is what should size what we transmit.
+    #[must_use]
+    pub fn peer_read_quality(&self) -> Option<f32> {
+        match self.peer_read_quality {
+            None | Some(0) => None,
+            Some(q) => Some(f32::from(q - 1) / 254.0),
+        }
     }
 
     /// Whether we can see the peer.
@@ -249,6 +291,7 @@ impl Session {
                 let mut payload = Vec::with_capacity(HELLO_LEN);
                 payload.extend_from_slice(&self.local.0);
                 payload.extend_from_slice(&self.pairing.announcement());
+                payload.push(self.read_quality);
                 payload
             },
         }
@@ -272,7 +315,8 @@ impl Session {
                 }
                 let id: [u8; 16] = pdu.payload[..16].try_into().expect("length checked");
                 let peer_public: [u8; 32] = pdu.payload[16..48].try_into().expect("length checked");
-                let peer_nonce: [u8; 16] = pdu.payload[48..HELLO_LEN]
+                self.peer_read_quality = Some(pdu.payload[HELLO_LEN - 1]);
+                let peer_nonce: [u8; 16] = pdu.payload[48..HELLO_LEN - 1]
                     .try_into()
                     .expect("length checked");
                 let remote = PeerId::from_bytes(id);
@@ -377,6 +421,7 @@ impl Session {
                 self.state = State::Discovering;
                 self.last_rx = None;
                 self.peer_sees_us = false;
+                self.peer_read_quality = None;
                 // Keys agreed with a peer that is gone are not keys worth
                 // keeping, and the next code shown should be a fresh one.
                 self.pairing.rotate();

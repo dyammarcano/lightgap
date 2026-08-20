@@ -182,6 +182,40 @@ impl Modem {
         self.session.state()
     }
 
+    /// Records how well this end is reading the peer, to be reported to them.
+    pub fn set_read_quality(&mut self, fraction: f32) {
+        self.session.set_read_quality(fraction);
+    }
+
+    /// How well the peer says it is reading this end.
+    #[must_use]
+    pub fn peer_read_quality(&self) -> Option<f32> {
+        self.session.peer_read_quality()
+    }
+
+    /// Resizes what this end transmits, and says whether it took.
+    ///
+    /// Refused while a transfer is in flight, and not out of caution. The
+    /// object transfer information travels in the metadata and pins the symbol
+    /// size for the whole object; changing it underneath a sender in progress
+    /// would produce symbols the receiver validates against the wrong size and
+    /// rejects — every one of them, silently, looking exactly like a channel
+    /// that had stopped working.
+    pub fn set_mtu(&mut self, mtu: usize) -> bool {
+        if !matches!(self.sending, Sending::Idle) {
+            return false;
+        }
+        let payload = mtu.saturating_sub(OVERHEAD);
+        let Some(size) = symbol_size_for(payload) else {
+            return false;
+        };
+        if size == self.symbol_size {
+            return false;
+        }
+        self.symbol_size = size;
+        true
+    }
+
     /// Whether this end can see the peer.
     #[must_use]
     pub const fn sees_peer(&self) -> bool {

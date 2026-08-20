@@ -353,3 +353,27 @@ fn a_file_transfers_through_real_qr_codes_and_a_synthetic_camera() {
         100.0 * f64::from(decoded) / f64::from(photographed.max(1))
     );
 }
+
+#[test]
+fn the_frame_size_will_not_change_under_a_transfer_in_flight() {
+    let mut m = Modem::new(PeerId::from_bytes([7u8; 16]), 256);
+    let before = m.symbol_size();
+
+    assert!(m.set_mtu(512), "an idle modem should take a new frame size");
+    assert_ne!(m.symbol_size(), before);
+
+    let resized = m.symbol_size();
+    m.send_file("payload.bin", vec![0xA5; 4096]);
+
+    assert!(
+        !m.set_mtu(1024),
+        "resizing under a sender in flight would produce symbols the receiver \
+         validates against the size pinned in the metadata and rejects — every \
+         one of them, looking exactly like a channel that had stopped working"
+    );
+    assert_eq!(
+        m.symbol_size(),
+        resized,
+        "a refused resize must leave the size alone, not partly apply it"
+    );
+}

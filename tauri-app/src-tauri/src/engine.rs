@@ -7,6 +7,7 @@
 
 use std::time::{Duration, Instant};
 
+use link_calibration::adaptive::Aimd;
 use modem::{Event, Modem};
 use optical_codec::decode::FrameScan;
 // Only the test-only end-to-end path decodes here now; the application decodes
@@ -14,7 +15,7 @@ use optical_codec::decode::FrameScan;
 #[cfg(test)]
 use optical_codec::decode::scan_greyscale;
 use optical_codec::device::{suggest_profile, FormFactor, VisualCapabilities};
-use optical_codec::encode::{encode, Ecc};
+use optical_codec::encode::{encode, max_payload, Ecc};
 use optical_codec::geometry::{advise, Advice, QrGeometry};
 use optical_protocol::session::PeerId;
 
@@ -81,6 +82,14 @@ pub fn starting_mtu() -> usize {
 /// is very slow.
 pub const MINIMUM_MTU: usize = 64;
 
+/// How much the frame grows on each step up.
+///
+/// Additive on the way up and multiplicative on the way down, which is the
+/// asymmetry every congestion control shares and for the same reason: the cost
+/// of overshooting is losing the link, and the cost of undershooting is only
+/// being slower for a few seconds.
+const MTU_STEP: u32 = 32;
+
 /// Window the throughput figures are measured over.
 ///
 /// Short enough to react while someone is still adjusting the aim, long enough
@@ -121,6 +130,11 @@ pub struct Status {
     pub offered_bps: f32,
     /// Payload bytes per second arriving and decoding successfully.
     pub delivered_bps: f32,
+    /// How well the peer says it is reading this end, once it has measured.
+    ///
+    /// The figure that should size and dim this end's transmitter — not our own
+    /// read rate, which measures the opposite direction.
+    pub peer_read_quality: Option<f32>,
     /// The digits both users compare, once key agreement has completed.
     pub sas: Option<String>,
     /// Seconds until the pairing code on screen is replaced. `None` once a peer
@@ -184,6 +198,9 @@ pub struct Engine {
     offered_bps: f32,
     delivered_bps: f32,
     rate_ticks: u32,
+    /// Frame-size control, driven by what the *peer* says it is reading.
+    mtu: Aimd,
+    with_code_at_mark: u64,
     last_geometry: Option<QrGeometry>,
     last_advice: Advice,
     received: Option<(String, Vec<u8>)>,
@@ -216,6 +233,17 @@ impl Engine {
             offered_bps: 0.0,
             delivered_bps: 0.0,
             rate_ticks: 0,
+            mtu: Aimd::new(
+                starting_mtu() as u32,
+                MINIMUM_MTU as u32,
+                // The encoder's ceiling, not a guess at the link's. A code that
+                // large is unreadable in practice and the controller will never
+                // get near it — but the limit that stops it should be the
+                // measured quality coming back, not a number chosen here.
+                max_payload(DISPLAY_ECC) as u32,
+                MTU_STEP,
+            ),
+            with_code_at_mark: 0,
             last_geometry: None,
             last_advice: Advice::MoveCloser,
             received: None,
@@ -235,6 +263,50 @@ impl Engine {
         self.log.push(line);
         if self.log.len() > LOG_CAPACITY {
             self.log.remove(0);
+        }
+    }
+
+    /// Resizes what this end transmits, from what the peer reports.
+    ///
+    /// The peer's number, never our own. Our read rate measures their display
+    /// against our camera; theirs measures our display against their camera,
+    /// and those are different pieces of hardware pointed in opposite
+    /// directions. Sizing our transmissions from our own reading would be
+    /// tuning one direction using a measurement of the other.
+    fn adapt_frame_size(&mut self) {
+        let Some(quality) = self.modem.peer_read_quality() else {
+            return;
+        };
+        // Nothing has been reported until a peer has been seen; a fresh session
+        // reports zero, and acting on that would shrink the frame before the
+        // link has had a chance to say anything.
+        if !self.modem.sees_peer() {
+            return;
+        }
+
+        let before = self.mtu.current();
+        let verdict = self.mtu.observe(quality);
+        let after = self.mtu.current();
+        if after == before {
+            return;
+        }
+
+        if self.modem.set_mtu(after as usize) {
+            self.note(format!(
+                "frame {before} -> {after} B ({verdict:?}, peer reads {:.0}%)",
+                quality * 100.0
+            ));
+        } else {
+            // Refused, which mid-transfer is correct: the symbol size is pinned
+            // for the object being sent. Put the controller back where the
+            // modem actually is so the next window does not compound a change
+            // that never happened.
+            self.mtu = Aimd::new(
+                before,
+                MINIMUM_MTU as u32,
+                max_payload(DISPLAY_ECC) as u32,
+                MTU_STEP,
+            );
         }
     }
 
@@ -266,6 +338,9 @@ impl Engine {
             self.delivered_bps,
             m.decode_ms,
         ));
+        if let Some(q) = self.modem.peer_read_quality() {
+            self.note(format!("peer reports reading us at {:.0}%", q * 100.0));
+        }
     }
 
     fn now(&self) -> std::time::Duration {
@@ -379,9 +454,24 @@ impl Engine {
         self.offered_bps = displayed as f32 * payload / seconds;
         self.delivered_bps = decoded as f32 * payload / seconds;
 
+        // How well this end read what it could actually see, over this window
+        // alone. Not the lifetime rate: that divides by every frame captured
+        // while nothing was pointed at the camera, so it reads as a broken link
+        // during setup and then lags for minutes once one is working. And not
+        // frames-captured either — a frame with no code in it is not a failure
+        // to read, it is nothing to read.
+        let seen = self.metrics.frames_with_code - self.with_code_at_mark;
+        if seen > 0 {
+            let quality = decoded as f32 / seen as f32;
+            self.modem.set_read_quality(quality);
+        }
+
+        self.adapt_frame_size();
+
         self.rate_since = Instant::now();
         self.displayed_at_mark = self.metrics.frames_displayed;
         self.decoded_at_mark = self.metrics.frames_decoded;
+        self.with_code_at_mark = self.metrics.frames_with_code;
 
         // Every fifth window, so roughly every ten seconds.
         self.rate_ticks = self.rate_ticks.wrapping_add(1);
@@ -512,6 +602,7 @@ impl Engine {
             payload_per_frame: self.modem.payload_per_frame(),
             offered_bps: self.offered_bps,
             delivered_bps: self.delivered_bps,
+            peer_read_quality: self.modem.peer_read_quality(),
             sas: self.modem.short_auth_string().map(ToOwned::to_owned),
             pairing_expires_in: self
                 .modem
