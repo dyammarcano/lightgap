@@ -9,9 +9,40 @@ use std::time::Duration;
 
 use optical_protocol::crypto::SAS_DIGITS;
 use optical_protocol::session::{
-    Event, PeerId, Role, Session, State, HELLO_INTERVAL, HELLO_LEN, PAIRING_ROTATION, PEER_TIMEOUT,
+    Event, PeerId, Role, Session, State, BEACON_LEN, HELLO_INTERVAL, HELLO_LEN, PAIRING_ROTATION,
+    PEER_TIMEOUT,
 };
+
 use optical_protocol::wire::{Flags, Pdu, PduKind};
+
+/// Drives two sessions until both have agreed keys.
+///
+/// Two round trips, not one, and that is the shape of the handshake now rather
+/// than a quirk of the harness. Each side announces itself with the smallest
+/// frame the protocol can express; only once someone has answered does either
+/// spend modules on key material.
+fn link(a: &mut Session, b: &mut Session) -> Duration {
+    // Starts far ahead of anything a test is likely to have reached. The
+    // sessions own their own clocks and a harness that hands one a time earlier
+    // than it has already seen stops it announcing entirely — which reads as a
+    // handshake that never completes rather than as the harness being wrong.
+    let mut clock = PAIRING_ROTATION * 64;
+    for _ in 0..8 {
+        if let Some(pdu) = a.poll_transmit() {
+            b.handle_incoming(&pdu);
+        }
+        if let Some(pdu) = b.poll_transmit() {
+            a.handle_incoming(&pdu);
+        }
+        if a.is_paired() && b.is_paired() {
+            return clock;
+        }
+        clock += HELLO_INTERVAL;
+        a.handle_timeout(clock);
+        b.handle_timeout(clock);
+    }
+    panic!("the two ends never paired");
+}
 
 fn peer(n: u8) -> PeerId {
     let mut b = [0u8; 16];
@@ -44,16 +75,30 @@ fn starts_out_looking_for_a_peer() {
 fn announces_itself_while_searching() {
     let mut s = Session::new(peer(1));
     let pdu = s.poll_transmit().expect("should announce itself");
-    assert_eq!(pdu.kind, PduKind::Hello);
     assert!(pdu.flags.contains(Flags::SYN));
-    assert_eq!(pdu.payload.len(), HELLO_LEN);
     assert_eq!(
-        &pdu.payload[..16],
-        peer(1).as_bytes(),
-        "the identifier leads the announcement: role election reads it"
+        pdu.kind,
+        PduKind::Beacon,
+        "while searching, the smallest frame the protocol can express"
     );
+    assert_eq!(pdu.payload.len(), BEACON_LEN);
+    assert_eq!(
+        pdu.payload,
+        peer(1).as_bytes(),
+        "the identifier and nothing else: a peer that cannot read this cannot \
+         read anything, so there is nothing to gain by sending more"
+    );
+
+    // Once someone has answered, the link has shown it carries at least that
+    // much, and the full announcement is worth its extra modules.
+    let mut s = s;
+    s.handle_incoming(&Session::new(peer(9)).poll_transmit().unwrap());
+    s.handle_timeout(HELLO_INTERVAL);
+    let pdu = s.poll_transmit().expect("should announce again");
+    assert_eq!(pdu.kind, PduKind::Hello);
+    assert_eq!(pdu.payload.len(), HELLO_LEN);
     assert!(
-        pdu.payload[16..].iter().any(|b| *b != 0),
+        pdu.payload[16..48].iter().any(|b| *b != 0),
         "an announcement with no key material in it would pair with anything"
     );
 }
@@ -136,19 +181,15 @@ fn discovering_a_peer_happens_exactly_once() {
     let mut a = Session::new(peer(1));
     let hello = Session::new(peer(9)).poll_transmit().unwrap();
 
-    // One announcement both reveals the peer and completes the key agreement,
-    // because it carries the identifier and the public key together. There is
-    // no second round trip to wait for.
+    // A beacon reveals the peer and nothing more: it carries no key material,
+    // so there is nothing yet to agree on.
     let events = a.handle_incoming(&hello);
     assert_eq!(
         events,
-        vec![
-            Event::PeerDiscovered {
-                peer: peer(9),
-                role: Role::Leader
-            },
-            Event::Paired
-        ]
+        vec![Event::PeerDiscovered {
+            peer: peer(9),
+            role: Role::Leader
+        }]
     );
 
     assert!(
@@ -348,11 +389,7 @@ fn both_sides_derive_the_same_authentication_string() {
     let mut a = Session::new(peer(1));
     let mut b = Session::new(peer(9));
 
-    let hello_a = a.poll_transmit().expect("a announces");
-    let hello_b = b.poll_transmit().expect("b announces");
-
-    a.handle_incoming(&hello_b);
-    b.handle_incoming(&hello_a);
+    let _ = link(&mut a, &mut b);
 
     let sas_a = a.short_auth_string().expect("a paired").to_owned();
     let sas_b = b.short_auth_string().expect("b paired").to_owned();
@@ -365,7 +402,7 @@ fn both_sides_derive_the_same_authentication_string() {
 }
 
 #[test]
-fn the_pairing_code_changes_when_nobody_answers() {
+fn the_identifier_survives_a_rotation() {
     let mut s = Session::new(peer(1));
     let first = s.poll_transmit().expect("announces").payload;
 
@@ -373,15 +410,35 @@ fn the_pairing_code_changes_when_nobody_answers() {
     let after = s.poll_transmit().expect("announces again").payload;
 
     assert_eq!(
-        first[..16],
-        after[..16],
-        "the identifier must survive rotation: role election compares identifiers, \
-         and a peer whose identifier moves is a different peer to whoever is watching"
+        first, after,
+        "role election compares identifiers, and a peer whose identifier moved \
+         would be a different peer to whoever was watching. The ephemeral key \
+         rotates underneath, but a beacon does not carry one — which is rather \
+         the point: there is nothing in it worth photographing."
     );
-    assert_ne!(
-        first[16..],
-        after[16..],
-        "a code left facing a window all afternoon should not still open the link"
+}
+
+#[test]
+fn a_peer_arriving_after_several_rotations_still_pairs() {
+    let mut a = Session::new(peer(1));
+
+    // Nobody answers for a long time, so a draws fresh keys repeatedly.
+    let mut clock = PAIRING_ROTATION;
+    for _ in 0..4 {
+        a.handle_timeout(clock);
+        let _ = a.poll_transmit();
+        clock += PAIRING_ROTATION;
+    }
+
+    let mut b = Session::new(peer(9));
+    let _ = link(&mut a, &mut b);
+
+    assert_eq!(
+        a.short_auth_string(),
+        b.short_auth_string(),
+        "whatever key a ended up holding, both ends must agree on it — a \
+         rotation that left the two sides derived from different material would \
+         look like a corrupt channel rather than a key mismatch"
     );
 }
 
@@ -415,16 +472,24 @@ fn a_rotation_on_the_peers_side_is_recovered_from() {
     let mut a = Session::new(peer(1));
     let mut b = Session::new(peer(9));
 
-    // b announces and a pairs against that key.
-    let old_b = b.poll_transmit().expect("b announces");
-    a.handle_incoming(&old_b);
+    // Pair properly first: a beacon each way, then the announcements that
+    // carry keys.
+    let mut clock = link(&mut a, &mut b);
     let first = a.short_auth_string().expect("a paired").to_owned();
 
-    // Nobody answered b in time, so b draws a fresh key. This is the window
-    // that matters: a is holding keys derived from material b has discarded.
-    b.handle_timeout(PAIRING_ROTATION);
+    // b loses a, falls back to searching, and draws a new key. This is the
+    // window that matters: a is still holding keys derived from material b has
+    // discarded.
+    clock += PEER_TIMEOUT * 2;
+    b.handle_timeout(clock);
+    assert!(!b.is_paired(), "b should have let go of a");
+
+    // b finds a again and announces with its new key.
+    a.handle_timeout(clock);
+    b.handle_incoming(&a.poll_transmit().expect("a announces"));
+    clock += HELLO_INTERVAL;
+    b.handle_timeout(clock);
     let new_b = b.poll_transmit().expect("b announces again");
-    assert_ne!(old_b.payload, new_b.payload);
 
     // Seeing the new material, a agrees again rather than keeping keys that
     // cannot work. Without this the two ends stay silently out of step, and a
@@ -434,6 +499,8 @@ fn a_rotation_on_the_peers_side_is_recovered_from() {
     assert_ne!(first, second);
 
     // And b, once it sees a, lands on the same digits.
+    clock += HELLO_INTERVAL;
+    a.handle_timeout(clock);
     let hello_a = a.poll_transmit().expect("a announces");
     b.handle_incoming(&hello_a);
     assert_eq!(b.short_auth_string(), Some(second.as_str()));
@@ -499,8 +566,7 @@ fn each_end_reports_how_well_it_reads_the_other() {
     let mut b = Session::new(peer(9));
 
     a.set_read_quality(0.8);
-    let hello_a = a.poll_transmit().expect("a announces");
-    b.handle_incoming(&hello_a);
+    let _ = link(&mut a, &mut b);
 
     let reported = b.peer_read_quality().expect("b was told");
     assert!(
@@ -508,13 +574,8 @@ fn each_end_reports_how_well_it_reads_the_other() {
         "b should learn how well a is reading it, got {reported}"
     );
 
-    // And it is the peer's number, not b's own. b has read nothing well or
-    // badly yet; what it now knows is a's opinion of b's display.
-    assert_eq!(
-        a.peer_read_quality(),
-        None,
-        "a has heard nothing back, and should not invent a figure"
-    );
+    // And it is the peer's number, not b's own: what b now knows is a's opinion
+    // of b's display, which is the only figure that should size what b sends.
 }
 
 #[test]
@@ -523,8 +584,7 @@ fn a_peer_that_has_measured_nothing_is_not_a_peer_reading_at_zero() {
     // b has just started: it has read nothing, well or badly.
     let mut b = Session::new(peer(9));
 
-    b.handle_timeout(HELLO_INTERVAL);
-    a.handle_incoming(&b.poll_transmit().expect("b announces"));
+    let clock = link(&mut a, &mut b);
 
     assert_eq!(
         a.peer_read_quality(),
@@ -534,7 +594,7 @@ fn a_peer_that_has_measured_nothing_is_not_a_peer_reading_at_zero() {
 
     // Once b has actually measured badly, that *is* worth acting on.
     b.set_read_quality(0.0);
-    b.handle_timeout(HELLO_INTERVAL * 2);
+    b.handle_timeout(clock + HELLO_INTERVAL);
     a.handle_incoming(&b.poll_transmit().expect("b announces again"));
     assert_eq!(a.peer_read_quality(), Some(0.0));
 }
@@ -545,16 +605,39 @@ fn the_reported_quality_is_forgotten_with_the_peer() {
     let mut b = Session::new(peer(9));
 
     b.set_read_quality(0.9);
-    b.handle_timeout(HELLO_INTERVAL);
-    a.handle_incoming(&b.poll_transmit().expect("b announces"));
+    let clock = link(&mut a, &mut b);
     assert!(a.peer_read_quality().is_some());
 
-    a.handle_timeout(HELLO_INTERVAL + PEER_TIMEOUT);
+    a.handle_timeout(clock + PEER_TIMEOUT * 2);
     assert_eq!(
         a.peer_read_quality(),
         None,
         "a figure from a peer that has gone is not a measurement of anything, \
          and sizing the next transmission from it would size it for a link \
          that no longer exists"
+    );
+}
+
+#[test]
+fn the_searching_frame_is_smaller_than_the_paired_one() {
+    let mut a = Session::new(peer(1));
+    let searching = a.poll_transmit().expect("a announces").to_vec().unwrap();
+
+    a.handle_incoming(&Session::new(peer(9)).poll_transmit().unwrap());
+    a.handle_timeout(HELLO_INTERVAL);
+    let paired = a
+        .poll_transmit()
+        .expect("a announces again")
+        .to_vec()
+        .unwrap();
+
+    assert!(
+        searching.len() * 2 < paired.len(),
+        "acquisition must cost far fewer bytes than what follows it — {} against \
+         {}. A code's modules grow with the bytes in it and shrink to fit the \
+         same screen, so this ratio is the margin the link has before anything \
+         is known about what the peer can read",
+        searching.len(),
+        paired.len()
     );
 }

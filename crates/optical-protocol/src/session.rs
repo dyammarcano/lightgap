@@ -110,6 +110,9 @@ pub const HELLO_INTERVAL: Duration = Duration::from_millis(500);
 /// the session collapsing constantly.
 pub const PEER_TIMEOUT: Duration = Duration::from_secs(5);
 
+/// Bytes in a `Beacon` payload: the peer identifier, and nothing else.
+pub const BEACON_LEN: usize = 16;
+
 /// Bytes in a `Hello` payload: peer identifier, key material, then one byte
 /// saying how well this end is reading the other.
 ///
@@ -280,6 +283,41 @@ impl Session {
         acc | 1
     }
 
+    /// Records a peer seen in any announcement, whichever shape it arrived in.
+    ///
+    /// A session identifier is derived from *both* identifiers, so a peer can
+    /// only be carrying ours if it has read ours. Their first announcement
+    /// carries zero, because at that moment they had not. Nothing extra goes on
+    /// the wire to learn this: the proof was already in a field that had to be
+    /// there anyway.
+    fn observe_peer(&mut self, remote: PeerId, session_id: u64, events: &mut Vec<Event>) {
+        self.peer_sees_us = session_id == Self::derive_session_id(&self.local, &remote);
+
+        if self.remote != Some(remote) {
+            self.remote = Some(remote);
+            self.session_id = Self::derive_session_id(&self.local, &remote);
+            let role = if self.local < remote {
+                Role::Leader
+            } else {
+                Role::Follower
+            };
+            self.role = Some(role);
+            self.state = State::Peered;
+            events.push(Event::PeerDiscovered { peer: remote, role });
+        }
+    }
+
+    fn beacon(&self) -> Pdu {
+        Pdu {
+            session_id: self.session_id,
+            kind: PduKind::Beacon,
+            flags: Flags::SYN,
+            seq: 0,
+            ack: 0,
+            payload: self.local.0.to_vec(),
+        }
+    }
+
     fn hello(&self) -> Pdu {
         Pdu {
             session_id: self.session_id,
@@ -306,6 +344,20 @@ impl Session {
         let mut events = Vec::new();
 
         match pdu.kind {
+            PduKind::Beacon => {
+                if pdu.payload.len() != BEACON_LEN {
+                    return events;
+                }
+                let id: [u8; 16] = pdu.payload[..].try_into().expect("length checked");
+                let remote = PeerId::from_bytes(id);
+                if remote == self.local {
+                    return events;
+                }
+                self.observe_peer(remote, pdu.session_id, &mut events);
+                // No key material here, so no agreement. It arrives with the
+                // `Hello` this discovery causes the peer to start sending.
+            }
+
             PduKind::Hello => {
                 if pdu.payload.len() != HELLO_LEN {
                     // A `Hello` of the wrong size belongs to another protocol
@@ -326,26 +378,7 @@ impl Session {
                     return events;
                 }
 
-                // A session identifier is derived from *both* identifiers, so
-                // a peer can only be carrying ours if it has read ours. Their
-                // first announcement carries zero, because at that moment they
-                // had not. Nothing extra goes on the wire to learn this: the
-                // proof was already in a field that had to be there anyway.
-                let agreed = Self::derive_session_id(&self.local, &remote);
-                self.peer_sees_us = pdu.session_id == agreed;
-
-                if self.remote != Some(remote) {
-                    self.remote = Some(remote);
-                    self.session_id = Self::derive_session_id(&self.local, &remote);
-                    let role = if self.local < remote {
-                        Role::Leader
-                    } else {
-                        Role::Follower
-                    };
-                    self.role = Some(role);
-                    self.state = State::Peered;
-                    events.push(Event::PeerDiscovered { peer: remote, role });
-                }
+                self.observe_peer(remote, pdu.session_id, &mut events);
 
                 // Agree, or agree again if the peer is announcing material we
                 // have not used yet. Re-running is cheap and it is what makes a
@@ -387,11 +420,25 @@ impl Session {
         if let Some(pdu) = self.pending.take() {
             return Some(pdu);
         }
-        // `Hello` keeps repeating after a peer is found: the other side may not
-        // have seen ours yet, and discovery is not symmetric in time.
+        // Two shapes, and which one goes out is decided by whether anything is
+        // known to be listening.
+        //
+        // While searching, the smallest frame the protocol can express: a peer
+        // that cannot read a bare identifier cannot read anything, so there is
+        // nothing to gain by sending more and a great deal to lose. Once a peer
+        // has answered, the link has demonstrated it carries at least that
+        // much, and the full announcement — key material, and how well this end
+        // is reading — is worth its extra modules.
+        //
+        // It keeps repeating after a peer is found because the other side may
+        // not have seen ours yet: discovery is not symmetric in time.
         if matches!(self.state, State::Discovering | State::Peered) && self.now >= self.next_hello {
             self.next_hello = self.now + HELLO_INTERVAL;
-            return Some(self.hello());
+            return Some(if self.remote.is_some() {
+                self.hello()
+            } else {
+                self.beacon()
+            });
         }
         None
     }

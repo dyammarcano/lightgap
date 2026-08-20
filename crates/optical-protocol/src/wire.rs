@@ -66,6 +66,19 @@ pub enum PduKind {
     Complete = 7,
     /// Explicit abort.
     Cancel = 8,
+    /// Bare presence: the peer identifier and nothing else.
+    ///
+    /// Its whole purpose is to be readable when nothing else is. A code's
+    /// module count grows with the bytes in it, and its modules shrink to fit
+    /// the same screen — so the smallest frame the protocol can express is the
+    /// one that survives the worst camera, the longest distance and the dimmest
+    /// display. That is exactly the situation at the start, before either end
+    /// knows anything about what the other can read.
+    ///
+    /// Everything that costs bytes — key material, measurements, capabilities —
+    /// waits for `Hello`, which is only sent once a peer has been found and the
+    /// link is therefore known to carry something.
+    Beacon = 9,
 }
 
 impl PduKind {
@@ -79,6 +92,7 @@ impl PduKind {
             6 => Self::ProbeResult,
             7 => Self::Complete,
             8 => Self::Cancel,
+            9 => Self::Beacon,
             _ => return None,
         })
     }

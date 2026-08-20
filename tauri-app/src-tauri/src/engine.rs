@@ -423,6 +423,20 @@ impl Engine {
     }
 
     /// Takes in one greyscale camera frame.
+    /// Drops the display hold so a measurement can advance frames as fast as it
+    /// can render them.
+    ///
+    /// The hold is real elapsed time, which is right in the application and
+    /// useless in a harness: a hundred thousand frames at eighty milliseconds
+    /// each is two hours of sleeping to measure something that has nothing to
+    /// do with sleeping. What the harness is counting is *frames*; wall-clock
+    /// throughput is that count multiplied by the hold, and the multiplication
+    /// does not need to be waited through.
+    #[cfg(test)]
+    pub fn set_hold_for_measurement(&mut self, ms: u64) {
+        self.hold_ms = ms;
+    }
+
     /// Test-only since the decode moved in front of the IPC boundary. It is
     /// kept because it is the only path that exercises the decoder end to end
     /// against the synthetic camera, and that is the half of this worth testing:
@@ -734,6 +748,121 @@ mod tests {
 
     /// The application-level version of the end-to-end test: two engines find
     /// each other by photographing one another's screens.
+    /// Measures a whole transfer across the synthetic camera.
+    ///
+    /// Ignored by default because it takes minutes: every frame is encoded,
+    /// photographed through a perspective warp with supersampling, blur and
+    /// noise, and decoded — twice, once in each direction. Run it deliberately:
+    ///
+    /// ```text
+    /// cargo test -p lightgap --lib -- --ignored --nocapture measure
+    /// ```
+    ///
+    /// What it answers is the half of throughput that optics cannot explain:
+    /// how many frames a file actually costs, and whether the frame size climbs
+    /// while it is being sent. Wall-clock time is that frame count times the
+    /// display hold, which is arithmetic rather than something worth sleeping
+    /// through.
+    #[test]
+    #[ignore = "measurement, minutes long: run with --ignored --nocapture"]
+    fn measure_a_file_across_the_synthetic_camera() {
+        const BYTES: usize = 100_000;
+        const CEILING: u64 = 400_000;
+
+        let mut a = Engine::new();
+        let mut b = Engine::new();
+        a.set_hold_for_measurement(0);
+        b.set_hold_for_measurement(0);
+
+        let mut pair_frames = 0u64;
+        while !(a.status().peer_found && b.status().peer_found) && pair_frames < 400 {
+            exchange(&mut a, &mut b);
+            pair_frames += 1;
+        }
+        assert!(a.status().peer_found, "the two ends never paired");
+
+        // Idle but linked, which is where calibration actually happens.
+        //
+        // The frame cannot be resized under a transfer — the symbol size is
+        // pinned in the metadata for the whole object — so the size a file goes
+        // out at is whatever was settled on beforehand. A harness that pairs and
+        // sends in the same breath measures the starting guess and calls it the
+        // result; the application spends this time waiting for someone to
+        // choose a file.
+        let paired_at = a.status().payload_per_frame;
+        let idle_until = Instant::now() + Duration::from_secs(14);
+        while Instant::now() < idle_until {
+            exchange(&mut a, &mut b);
+        }
+        let settled = a.status().payload_per_frame;
+
+        let object: Vec<u8> = (0..BYTES)
+            .map(|i| (i.wrapping_mul(31) ^ 0x5A) as u8)
+            .collect();
+        let started = Instant::now();
+        a.send_file("measurement.bin", object.clone());
+
+        let first_frame = a.status().payload_per_frame;
+        let mut frames = 0u64;
+        while b.received_ref().is_none() && frames < CEILING {
+            exchange(&mut a, &mut b);
+            frames += 1;
+        }
+
+        let elapsed = started.elapsed();
+        let last_frame = a.status().payload_per_frame;
+        let received = b.received_ref().map(|(_, bytes)| bytes.len());
+
+        println!("\n--- transfer across the synthetic camera ---");
+        println!("object          {BYTES} B");
+        println!("frames          {frames}");
+        println!("frame at pair   {paired_at} B");
+        println!("after 14 s idle {settled} B");
+        println!("frame size      {first_frame} B -> {last_frame} B");
+        println!("harness time    {:.1} s", elapsed.as_secs_f32());
+        if frames > 0 {
+            let per_frame = BYTES as f32 / frames as f32;
+            println!("carried         {per_frame:.1} B per displayed frame");
+            for hold in [DEFAULT_HOLD_MS, 40] {
+                let seconds = frames as f32 * hold as f32 / 1000.0;
+                println!(
+                    "at {hold} ms hold   {:.0} B/s, {:.1} min for this file",
+                    BYTES as f32 / seconds,
+                    seconds / 60.0
+                );
+            }
+        }
+        println!("received        {received:?}");
+
+        assert!(
+            settled >= paired_at,
+            "calibration should not shrink a link nobody has complained about:              {paired_at} B became {settled} B while idle"
+        );
+        assert_eq!(
+            received,
+            Some(BYTES),
+            "the file did not arrive within {CEILING} frames"
+        );
+        assert!(
+            b.received_ref().is_some_and(|(_, got)| got == &object),
+            "what arrived was not what was sent"
+        );
+    }
+
+    /// One frame each way through the synthetic camera.
+    fn exchange(a: &mut Engine, b: &mut Engine) {
+        if let Some(frame) = pending_frame(a) {
+            if let Some((w, h, px)) = photograph(&frame) {
+                b.on_camera_frame(w, h, &px);
+            }
+        }
+        if let Some(frame) = pending_frame(b) {
+            if let Some((w, h, px)) = photograph(&frame) {
+                a.on_camera_frame(w, h, &px);
+            }
+        }
+    }
+
     #[test]
     fn two_engines_discover_each_other_through_a_camera() {
         let mut a = Engine::new();

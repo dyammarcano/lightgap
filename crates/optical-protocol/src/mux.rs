@@ -37,7 +37,11 @@ impl Priority {
         match pdu.kind {
             PduKind::Data => Self::Data,
             PduKind::Capabilities | PduKind::Probe | PduKind::ProbeResult => Self::Metadata,
-            PduKind::Hello | PduKind::Ack | PduKind::Complete | PduKind::Cancel => Self::Control,
+            PduKind::Beacon
+            | PduKind::Hello
+            | PduKind::Ack
+            | PduKind::Complete
+            | PduKind::Cancel => Self::Control,
         }
     }
 
