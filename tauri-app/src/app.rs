@@ -1343,6 +1343,17 @@ pub fn App() -> impl IntoView {
         });
     };
 
+    // Sized so it finishes in a minute or two on a link that is working, and
+    // does not tie one up for an afternoon if it is not.
+    let send_pattern = move |_| {
+        spawn_local(async move {
+            let args = Object::new();
+            let _ = Reflect::set(&args, &"bytes".into(), &JsValue::from(20_000_u32));
+            let res = invoke("send_test_pattern", args.into()).await;
+            set_message.set(res.as_string().unwrap_or_else(|| "could not queue".into()));
+        });
+    };
+
     let reset = move |_| {
         spawn_local(async move {
             invoke("reset", JsValue::UNDEFINED).await;
@@ -1792,6 +1803,7 @@ pub fn App() -> impl IntoView {
                             >
                                 "Save received…"
                             </button>
+                            <button class=BTN on:click=send_pattern>"Test 20 kB"</button>
                             <button class=BTN on:click=reset>"Reset"</button>
                         </div>
 

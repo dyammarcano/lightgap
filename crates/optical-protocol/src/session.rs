@@ -108,7 +108,16 @@ pub const HELLO_INTERVAL: Duration = Duration::from_millis(500);
 /// Generous relative to the `Hello` rate: an optical link loses frames in bursts
 /// — a passing hand, a reflection — and cutting at the first burst would have
 /// the session collapsing constantly.
-pub const PEER_TIMEOUT: Duration = Duration::from_secs(5);
+///
+/// Raised from five seconds after watching a real pair. Five is ample when both
+/// ends read nine frames in ten; it is nothing at all when one of them reads one
+/// in ten, where a gap that long is ordinary rather than evidence of anything.
+/// And the cost of being wrong is asymmetric by a wide margin. Declaring a peer
+/// lost tears down the session, resets the frame size to the floor and starts
+/// the whole acquisition again — which on a marginal link takes longer than the
+/// gap that triggered it, so the link spends its time re-acquiring instead of
+/// transferring. Waiting too long, by contrast, costs only the wait.
+pub const PEER_TIMEOUT: Duration = Duration::from_secs(15);
 
 /// Bytes in a `Beacon` payload: the peer identifier, and nothing else.
 pub const BEACON_LEN: usize = 16;

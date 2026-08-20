@@ -100,6 +100,7 @@ pub fn run() {
             commands::brightness_controllable,
             commands::set_brightness,
             commands::set_capabilities,
+            commands::send_test_pattern,
         ])
         .run(tauri::generate_context!())
         .expect("error while running lightgap");

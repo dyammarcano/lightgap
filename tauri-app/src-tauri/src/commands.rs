@@ -187,3 +187,23 @@ pub fn set_capabilities(
     engine.set_local_capabilities((camera_w, camera_h), (display_w, display_h));
     Ok(())
 }
+
+/// Queues a generated object of a given size for transfer.
+///
+/// Exists so a link can be measured without a file dialog in the way. Measuring
+/// a transfer is the only way to know what this link actually does — the
+/// per-frame figures are a guess at it — and on a tablet, reaching a file
+/// through a picker to start one is a great deal of ceremony around a
+/// measurement.
+///
+/// The content is deterministic, so a receiver can check what arrived is what
+/// was sent without either end being told the answer.
+#[tauri::command]
+pub fn send_test_pattern(state: State<'_, AppState>, bytes: usize) -> Result<String, String> {
+    let object: Vec<u8> = (0..bytes)
+        .map(|i| (i.wrapping_mul(31) ^ 0x5A) as u8)
+        .collect();
+    let mut engine = state.0.lock().map_err(|_| "engine lock poisoned")?;
+    engine.send_file("test-pattern.bin", object);
+    Ok(format!("test pattern of {bytes} B queued"))
+}
