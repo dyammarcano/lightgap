@@ -17,3 +17,23 @@
   --color-verified: #6ee7a8;
   --color-misread: #f2554b;
 }
+
+@layer base {
+  /* This is an application, not a document. Dragging a selection across the
+     interface is the tell that gives a web view away, and here it is worse than
+     cosmetic: the code pane is the transmitter, and a stray drag across it
+     paints a selection highlight over the very pixels the peer is reading. */
+  body {
+    -webkit-user-select: none;
+    user-select: none;
+    -webkit-touch-callout: none;
+  }
+
+  /* The exception. Log lines are diagnostic text, and the reason to look at
+     them at all is usually to copy one somewhere else. */
+  details li {
+    -webkit-user-select: text;
+    user-select: text;
+    cursor: text;
+  }
+}

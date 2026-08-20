@@ -45,6 +45,12 @@ pub enum Event {
     FileCorrupt { name: String },
     /// The peer confirmed it has the whole file.
     SendComplete,
+    /// Key agreement completed. The authentication string is available from
+    /// `short_auth_string`, and both users should compare it before trusting
+    /// the link — an authentication string nobody checks secures nothing.
+    Paired,
+    /// Nobody answered in time, so a fresh pairing code is on screen.
+    PairingRotated,
     /// The peer went quiet for too long.
     PeerLost,
     /// The session ended.
@@ -174,6 +180,35 @@ impl Modem {
     #[must_use]
     pub fn state(&self) -> State {
         self.session.state()
+    }
+
+    /// Whether this end can see the peer.
+    #[must_use]
+    pub const fn sees_peer(&self) -> bool {
+        self.session.sees_peer()
+    }
+
+    /// Whether the peer has proved it can see this end.
+    #[must_use]
+    pub const fn peer_sees_us(&self) -> bool {
+        self.session.peer_sees_us()
+    }
+
+    /// The digits both users compare, once key agreement has completed.
+    #[must_use]
+    pub fn short_auth_string(&self) -> Option<&str> {
+        self.session.short_auth_string()
+    }
+
+    #[must_use]
+    pub fn is_paired(&self) -> bool {
+        self.session.is_paired()
+    }
+
+    /// When the pairing code currently on screen expires, if one is showing.
+    #[must_use]
+    pub fn rotation_due(&self) -> Option<Duration> {
+        self.session.rotation_due()
     }
 
     #[must_use]
@@ -553,6 +588,8 @@ impl Modem {
 fn map_session_event(e: SessionEvent) -> Option<Event> {
     match e {
         SessionEvent::PeerDiscovered { peer, role } => Some(Event::PeerFound { peer, role }),
+        SessionEvent::Paired => Some(Event::Paired),
+        SessionEvent::PairingRotated => Some(Event::PairingRotated),
         SessionEvent::PeerLost => Some(Event::PeerLost),
         SessionEvent::Closed => Some(Event::Closed),
         SessionEvent::NegotiationStarted | SessionEvent::Ready => None,

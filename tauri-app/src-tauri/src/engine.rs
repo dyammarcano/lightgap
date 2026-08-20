@@ -8,6 +8,10 @@
 use std::time::Instant;
 
 use modem::{Event, Modem};
+use optical_codec::decode::FrameScan;
+// Only the test-only end-to-end path decodes here now; the application decodes
+// in front of the IPC boundary instead.
+#[cfg(test)]
 use optical_codec::decode::scan_greyscale;
 use optical_codec::device::{suggest_profile, FormFactor, VisualCapabilities};
 use optical_codec::encode::{encode, Ecc};
@@ -24,6 +28,16 @@ use optical_protocol::session::PeerId;
 /// 120 ms means a 30 fps camera gets roughly three chances at every code. Fewer
 /// than two and a single blurred frame loses the code entirely.
 pub const DEFAULT_HOLD_MS: u64 = 120;
+
+/// How long the pairing code stays on screen, in milliseconds.
+///
+/// Two hundred and fifty times the data hold, and deliberately so. A code that
+/// changes every 120 ms can only be read by another instance of this
+/// application running a capture loop; nothing else — no phone, no photograph,
+/// no person — gets a chance at it. The pairing code is the one frame a human
+/// may need to point something else at, so it stands still for as long as its
+/// ephemeral key is valid, and the session rotates both together.
+pub const PAIRING_HOLD_MS: u64 = 30_000;
 
 /// Error correction for displayed codes.
 ///
@@ -73,6 +87,13 @@ pub struct Status {
     pub session_state: String,
     pub role: Option<String>,
     pub peer_found: bool,
+    /// Whether this end can see the peer's code.
+    pub sees_peer: bool,
+    /// Whether the peer has proved it can see this end's code.
+    ///
+    /// Separate from the above because the link fails one direction at a time,
+    /// and the two answers send you to opposite ends of the table.
+    pub peer_sees_us: bool,
     pub sending: Option<String>,
     pub send_progress: f32,
     pub receiving: Option<String>,
@@ -84,6 +105,11 @@ pub struct Status {
     /// Pixels per module the camera is currently resolving.
     pub pixels_per_module: f32,
     pub payload_per_frame: usize,
+    /// The digits both users compare, once key agreement has completed.
+    pub sas: Option<String>,
+    /// Seconds until the pairing code on screen is replaced. `None` once a peer
+    /// has been found, because rotation stops there.
+    pub pairing_expires_in: Option<u64>,
     pub metrics: Metrics,
     pub log: Vec<String>,
 }
@@ -217,9 +243,17 @@ impl Engine {
             self.absorb(e);
         }
 
+        // While still looking, the code on screen is the pairing code and it
+        // holds for its whole validity window. Once there is a peer the link is
+        // a data stream again and the fast hold applies.
+        let hold = if self.modem.rotation_due().is_some() {
+            PAIRING_HOLD_MS
+        } else {
+            self.hold_ms
+        };
         let expired = match &self.current {
             None => true,
-            Some((_, since)) => since.elapsed().as_millis() as u64 >= self.hold_ms,
+            Some((_, since)) => since.elapsed().as_millis() as u64 >= hold,
         };
         if !expired {
             return &self.current_svg;
@@ -245,10 +279,33 @@ impl Engine {
     }
 
     /// Takes in one greyscale camera frame.
+    /// Test-only since the decode moved in front of the IPC boundary. It is
+    /// kept because it is the only path that exercises the decoder end to end
+    /// against the synthetic camera, and that is the half of this worth testing:
+    /// the half that has no interface to run inside.
+    #[cfg(test)]
     pub fn on_camera_frame(&mut self, width: usize, height: usize, pixels: &[u8]) -> FrameOutcome {
         let t0 = Instant::now();
         let scan = scan_greyscale(width, height, pixels);
-        let decode_ms = t0.elapsed().as_secs_f64() * 1000.0;
+        #[allow(clippy::cast_possible_truncation)]
+        let decode_ms = (t0.elapsed().as_secs_f64() * 1000.0) as f32;
+        self.on_scan(&scan, decode_ms)
+    }
+
+    /// Takes in the result of a scan someone else performed.
+    ///
+    /// Split out because the decode does not happen here in the running
+    /// application. Android's WebView cannot carry a raw binary body across the
+    /// IPC bridge, so nine hundred kilobytes of pixels per frame cannot cross it
+    /// at all; the interface decodes instead and sends what came out, which is
+    /// under a hundred bytes. Everything below this line is the same wherever
+    /// the decode ran.
+    ///
+    /// `on_camera_frame` stays, and the engine's tests still drive it: they
+    /// exercise the decoder against a synthetic camera, which is the half worth
+    /// testing and the half that has no interface to run inside.
+    pub fn on_scan(&mut self, scan: &FrameScan, decode_ms: f32) -> FrameOutcome {
+        let decode_ms = f64::from(decode_ms);
 
         self.metrics.frames_captured += 1;
         self.decode_ms_total += decode_ms;
@@ -315,6 +372,22 @@ impl Engine {
                 // camera.
                 self.note(format!("{name} arrived but the hash did not match"));
             }
+            Event::Paired => {
+                // The digits go in the log as well as on screen: if the two
+                // sides ever disagree, what matters afterwards is which value
+                // each one showed and when.
+                match self.modem.short_auth_string() {
+                    Some(sas) => self.note(format!("paired — compare {sas} on both screens")),
+                    None => self.note("paired"),
+                }
+            }
+            Event::PairingRotated => {
+                self.note("nobody answered, new pairing code");
+                // The code on screen is stale the instant its key is: drop it so
+                // the next poll draws the new one rather than waiting out a hold
+                // that belongs to a key nobody can use any more.
+                self.current = None;
+            }
             Event::SendComplete => self.note("the peer has the whole file"),
             Event::PeerLost => self.note("peer lost"),
             Event::Closed => self.note("session closed"),
@@ -328,6 +401,8 @@ impl Engine {
             session_state: format!("{:?}", self.modem.state()),
             role: self.modem.role().map(|r| format!("{r:?}")),
             peer_found: self.modem.role().is_some(),
+            sees_peer: self.modem.sees_peer(),
+            peer_sees_us: self.modem.peer_sees_us(),
             sending: self.modem.sending_file().map(ToOwned::to_owned),
             send_progress: self.modem.send_progress(),
             receiving: self.modem.receiving_file().map(ToOwned::to_owned),
@@ -337,6 +412,11 @@ impl Engine {
             advice: self.last_advice.message().to_owned(),
             pixels_per_module: self.last_geometry.map_or(0.0, |g| g.pixels_per_module),
             payload_per_frame: self.modem.payload_per_frame(),
+            sas: self.modem.short_auth_string().map(ToOwned::to_owned),
+            pairing_expires_in: self
+                .modem
+                .rotation_due()
+                .map(|due| due.saturating_sub(self.now()).as_secs()),
             metrics: self.metrics,
             log: self.log.clone(),
         }

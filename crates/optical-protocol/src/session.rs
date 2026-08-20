@@ -13,6 +13,7 @@
 use core::fmt;
 use core::time::Duration;
 
+use crate::crypto::{Pairing, ANNOUNCEMENT_LEN};
 use crate::wire::{Flags, Pdu, PduKind};
 
 /// Peer identifier, drawn when the application starts.
@@ -85,6 +86,10 @@ pub enum Event {
     NegotiationStarted,
     /// Ready to transfer.
     Ready,
+    /// Key agreement completed; the authentication string can be shown.
+    Paired,
+    /// A fresh ephemeral key was drawn because nobody had answered.
+    PairingRotated,
     /// The peer has been quiet for too long.
     PeerLost,
     /// Session over, with or without agreement.
@@ -105,6 +110,18 @@ pub const HELLO_INTERVAL: Duration = Duration::from_millis(500);
 /// the session collapsing constantly.
 pub const PEER_TIMEOUT: Duration = Duration::from_secs(5);
 
+/// Bytes in a `Hello` payload: peer identifier, then key material.
+pub const HELLO_LEN: usize = 16 + ANNOUNCEMENT_LEN;
+
+/// How long one pairing code stays valid before a fresh ephemeral key is drawn.
+///
+/// Long enough that the code is readable — photographable, even, which the
+/// animated data stream is not — and short enough that a code left facing a
+/// window does not stay usable all afternoon. Rotation stops the moment a peer
+/// is seen: past that point a changing key would only be a way to lose an
+/// agreement that already succeeded.
+pub const PAIRING_ROTATION: Duration = Duration::from_secs(30);
+
 /// The session.
 #[derive(Debug)]
 pub struct Session {
@@ -116,6 +133,14 @@ pub struct Session {
     now: Duration,
     last_rx: Option<Duration>,
     next_hello: Duration,
+    next_rotation: Duration,
+    /// Whether the peer has demonstrably seen us.
+    ///
+    /// Not the same question as whether we can see them, and the difference is
+    /// the useful one: an optical link fails one direction at a time, and
+    /// knowing which end is aimed wrong is most of knowing what to do about it.
+    peer_sees_us: bool,
+    pairing: Pairing,
     pending: Option<Pdu>,
 }
 
@@ -131,6 +156,9 @@ impl Session {
             now: Duration::ZERO,
             last_rx: None,
             next_hello: Duration::ZERO,
+            next_rotation: PAIRING_ROTATION,
+            peer_sees_us: false,
+            pairing: Pairing::new(),
             pending: None,
         }
     }
@@ -161,6 +189,38 @@ impl Session {
         self.local
     }
 
+    /// Whether we can see the peer.
+    #[must_use]
+    pub const fn sees_peer(&self) -> bool {
+        self.remote.is_some()
+    }
+
+    /// Whether the peer has proved it can see us.
+    #[must_use]
+    pub const fn peer_sees_us(&self) -> bool {
+        self.peer_sees_us
+    }
+
+    /// The digits for the user to compare across the two displays, once both
+    /// sides have each other's key material.
+    #[must_use]
+    pub fn short_auth_string(&self) -> Option<&str> {
+        self.pairing.short_auth_string()
+    }
+
+    #[must_use]
+    pub fn is_paired(&self) -> bool {
+        self.pairing.is_paired()
+    }
+
+    /// When the pairing code on screen stops being valid.
+    ///
+    /// `None` once a peer has been found, because rotation stops there.
+    #[must_use]
+    pub fn rotation_due(&self) -> Option<Duration> {
+        (self.state == State::Discovering).then_some(self.next_rotation)
+    }
+
     /// Derives the session identifier from the two peer identifiers.
     ///
     /// Deterministic and symmetric: both sides arrive at the same number without
@@ -185,7 +245,12 @@ impl Session {
             flags: Flags::SYN,
             seq: 0,
             ack: 0,
-            payload: self.local.0.to_vec(),
+            payload: {
+                let mut payload = Vec::with_capacity(HELLO_LEN);
+                payload.extend_from_slice(&self.local.0);
+                payload.extend_from_slice(&self.pairing.announcement());
+                payload
+            },
         }
     }
 
@@ -199,19 +264,31 @@ impl Session {
 
         match pdu.kind {
             PduKind::Hello => {
-                let Ok(bytes) = <[u8; 16]>::try_from(pdu.payload.as_slice()) else {
-                    // A `Hello` carrying a differently sized identifier belongs
-                    // to another protocol version. Ignore it: there is no way to
-                    // assign roles against a peer whose identifier is
-                    // unintelligible.
+                if pdu.payload.len() != HELLO_LEN {
+                    // A `Hello` of the wrong size belongs to another protocol
+                    // version. Ignore it: there is no way to assign roles
+                    // against a peer whose announcement is unintelligible.
                     return events;
-                };
-                let remote = PeerId::from_bytes(bytes);
+                }
+                let id: [u8; 16] = pdu.payload[..16].try_into().expect("length checked");
+                let peer_public: [u8; 32] = pdu.payload[16..48].try_into().expect("length checked");
+                let peer_nonce: [u8; 16] = pdu.payload[48..HELLO_LEN]
+                    .try_into()
+                    .expect("length checked");
+                let remote = PeerId::from_bytes(id);
                 if remote == self.local {
                     // Seeing yourself — a mirror, or your own screen in frame —
                     // is not discovering a peer.
                     return events;
                 }
+
+                // A session identifier is derived from *both* identifiers, so
+                // a peer can only be carrying ours if it has read ours. Their
+                // first announcement carries zero, because at that moment they
+                // had not. Nothing extra goes on the wire to learn this: the
+                // proof was already in a field that had to be there anyway.
+                let agreed = Self::derive_session_id(&self.local, &remote);
+                self.peer_sees_us = pdu.session_id == agreed;
 
                 if self.remote != Some(remote) {
                     self.remote = Some(remote);
@@ -224,6 +301,24 @@ impl Session {
                     self.role = Some(role);
                     self.state = State::Peered;
                     events.push(Event::PeerDiscovered { peer: remote, role });
+                }
+
+                // Agree, or agree again if the peer is announcing material we
+                // have not used yet. Re-running is cheap and it is what makes a
+                // rotation on either side recoverable instead of a dead link.
+                if !self.pairing.agreed_with(&peer_public) {
+                    match self
+                        .pairing
+                        .agree(self.local, remote, &peer_public, &peer_nonce)
+                    {
+                        Ok(()) => events.push(Event::Paired),
+                        Err(_) => {
+                            // A key we cannot agree with is a peer that is
+                            // broken or hostile. Stay discoverable rather than
+                            // pretending to be paired.
+                            self.pairing.forget();
+                        }
+                    }
                 }
             }
 
@@ -262,6 +357,14 @@ impl Session {
         self.now = now;
         let mut events = Vec::new();
 
+        // Ahead of the early return below, because rotating only matters while
+        // still looking — which is exactly the state that returns early.
+        if self.state == State::Discovering && now >= self.next_rotation {
+            self.pairing.rotate();
+            self.next_rotation = now + PAIRING_ROTATION;
+            events.push(Event::PairingRotated);
+        }
+
         if matches!(self.state, State::Closed | State::Discovering) {
             return events;
         }
@@ -273,6 +376,11 @@ impl Session {
                 self.session_id = 0;
                 self.state = State::Discovering;
                 self.last_rx = None;
+                self.peer_sees_us = false;
+                // Keys agreed with a peer that is gone are not keys worth
+                // keeping, and the next code shown should be a fresh one.
+                self.pairing.rotate();
+                self.next_rotation = now + PAIRING_ROTATION;
                 // Resume announcing immediately: whoever just lost the peer is
                 // the one in the biggest hurry to be found again.
                 self.next_hello = now;

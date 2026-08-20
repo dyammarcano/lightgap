@@ -14,6 +14,14 @@ serde-wasm-bindgen = "0.6"
 console_error_panic_hook = "0.1.7"
 gloo-timers = { version = "0.3", features = ["futures"] }
 
+# The decode runs here now rather than in the backend. See on_scan in the
+# engine for why: a raw binary body cannot cross Android's IPC bridge.
+optical-codec = { path = "../crates/optical-codec" }
+# Both of these reach for the OS entropy source, which on wasm has to be told
+# to use the browser's.
+getrandom_02 = { package = "getrandom", version = "0.2", features = ["js"] }
+getrandom = { version = "0.3", features = ["wasm_js"] }
+
 [dependencies.web-sys]
 version = "0.3"
 features = [
@@ -28,6 +36,7 @@ features = [
     "MediaStreamConstraints",
     "MediaStreamTrack",
     "Navigator",
+    "Storage",
     "Performance",
     "Window",
 ]

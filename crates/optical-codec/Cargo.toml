@@ -9,6 +9,9 @@ description = "Optical frame (QR) encoding and decoding, plus framing geometry"
 optical-protocol = { path = "../optical-protocol" }
 qrcode = { version = "0.14", default-features = false }
 rqrr = "0.9"
+# The scan result crosses the process boundary: the decode happens in the
+# interface and the engine consumes what came out of it.
+serde = { version = "1", features = ["derive"] }
 thiserror.workspace = true
 
 [dev-dependencies]

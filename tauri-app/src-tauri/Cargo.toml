@@ -31,6 +31,13 @@ modem = { path = "../../crates/modem" }
 optical-codec = { path = "../../crates/optical-codec" }
 optical-protocol = { path = "../../crates/optical-protocol" }
 
+# Desktop only. The crate is `#![cfg(not(android/ios))]` at its root, so on
+# mobile it compiles to nothing and any use of it fails to resolve — and a
+# window whose size and position are worth remembering is a desktop idea to
+# begin with.
+[target.'cfg(not(any(target_os = "android", target_os = "ios")))'.dependencies]
+tauri-plugin-window-state = "2.4.1"
+
 [dev-dependencies]
 # The synthetic camera, so the engine can be exercised without a window or a
 # webcam. Testing the pacing and the frame path by launching the app and looking

@@ -300,3 +300,113 @@ fn digits_from(bytes: &[u8], count: usize) -> String {
     let modulus = 10u64.pow(count as u32);
     format!("{:0width$}", acc % modulus, width = count)
 }
+
+/// Bytes of key material a `Hello` carries: public key then nonce.
+pub const ANNOUNCEMENT_LEN: usize = 48;
+
+/// The pairing half of a session.
+///
+/// Separate from `Session` so that `Session` can go on deriving `Debug`. What
+/// lives here is either a secret or one derivation away from being one, and
+/// `SessionKeys` deliberately has no `Debug` at all.
+pub struct Pairing {
+    identity: Identity,
+    /// The peer key material the current agreement was computed against.
+    ///
+    /// Agreement re-runs when this changes. Without it, a rotation that lands
+    /// between one side reading the other's code and the reply coming back
+    /// leaves the two ends holding different keys — and a key mismatch on this
+    /// link is indistinguishable from a dirty lens.
+    agreed_against: Option<[u8; 32]>,
+    keys: Option<SessionKeys>,
+}
+
+impl std::fmt::Debug for Pairing {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // Says only whether pairing happened. Printing any of the rest would put
+        // key material one stray `dbg!` away from a log file.
+        f.debug_struct("Pairing")
+            .field("paired", &self.keys.is_some())
+            .finish_non_exhaustive()
+    }
+}
+
+impl Default for Pairing {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Pairing {
+    #[must_use]
+    pub fn new() -> Self {
+        Self {
+            identity: Identity::generate(),
+            agreed_against: None,
+            keys: None,
+        }
+    }
+
+    /// The key material to put in a `Hello`.
+    #[must_use]
+    pub fn announcement(&self) -> [u8; ANNOUNCEMENT_LEN] {
+        let mut out = [0u8; ANNOUNCEMENT_LEN];
+        out[..32].copy_from_slice(&self.identity.public_bytes());
+        out[32..].copy_from_slice(&self.identity.nonce());
+        out
+    }
+
+    /// Draws a fresh ephemeral identity and drops any agreement made with the
+    /// old one.
+    ///
+    /// Worth doing only while no peer has been seen. A pairing code that has sat
+    /// on a screen for half a minute may have been photographed, and the key it
+    /// carries should not stay valid for the rest of the day.
+    pub fn rotate(&mut self) {
+        self.identity = Identity::generate();
+        self.agreed_against = None;
+        self.keys = None;
+    }
+
+    #[must_use]
+    pub fn is_paired(&self) -> bool {
+        self.keys.is_some()
+    }
+
+    /// Whether this exact peer material has already been agreed against.
+    #[must_use]
+    pub fn agreed_with(&self, peer_public: &[u8; 32]) -> bool {
+        self.agreed_against.as_ref() == Some(peer_public)
+    }
+
+    /// Completes the key agreement, or redoes it against new peer material.
+    ///
+    /// # Errors
+    ///
+    /// Fails if the peer's public key is low-order, which means it is either
+    /// broken or hostile.
+    pub fn agree(
+        &mut self,
+        local_id: PeerId,
+        peer_id: PeerId,
+        peer_public: &[u8; 32],
+        peer_nonce: &[u8; 16],
+    ) -> Result<(), CryptoError> {
+        let keys = SessionKeys::agree(local_id, &self.identity, peer_id, peer_public, peer_nonce)?;
+        self.agreed_against = Some(*peer_public);
+        self.keys = Some(keys);
+        Ok(())
+    }
+
+    /// The digits to display for the user to compare, once there are any.
+    #[must_use]
+    pub fn short_auth_string(&self) -> Option<&str> {
+        self.keys.as_ref().map(SessionKeys::short_auth_string)
+    }
+
+    /// Drops the agreement without changing the identity.
+    pub fn forget(&mut self) {
+        self.agreed_against = None;
+        self.keys = None;
+    }
+}

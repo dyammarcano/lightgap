@@ -10,7 +10,7 @@ use optical_protocol::wire::{Pdu, WireError};
 use crate::geometry::{sharpness, Point, QrGeometry};
 
 /// A code read out of the frame.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(serde::Serialize, serde::Deserialize, Debug, Clone, PartialEq)]
 pub struct Detection {
     pub payload: Vec<u8>,
     pub geometry: QrGeometry,
@@ -22,13 +22,13 @@ pub struct Detection {
 /// and failing to decode it says the framing is fine and what is excessive is
 /// density, or what is missing is focus. Detecting nothing says nobody is there,
 /// or they are too far away.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(serde::Serialize, serde::Deserialize, Debug, Clone, PartialEq)]
 pub struct FailedDetection {
     pub geometry: QrGeometry,
 }
 
 /// What came out of one frame.
-#[derive(Debug, Clone, PartialEq, Default)]
+#[derive(serde::Serialize, serde::Deserialize, Debug, Clone, PartialEq, Default)]
 pub struct FrameScan {
     pub detections: Vec<Detection>,
     pub failed: Vec<FailedDetection>,

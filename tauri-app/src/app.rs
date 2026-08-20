@@ -9,7 +9,8 @@
 //! decision about what to transmit belongs to the engine, which belongs to the
 //! `modem` crate, which is tested without any of this.
 
-use js_sys::{Object, Reflect, Uint8Array};
+use js_sys::{Object, Reflect};
+use leptos::ev;
 use leptos::prelude::*;
 use leptos::task::spawn_local;
 use serde::Deserialize;
@@ -56,6 +57,182 @@ const DISPLAY_INTERVAL_MS: u32 = 40;
 
 /// How often the status panel refreshes.
 const STATUS_INTERVAL_MS: u32 = 250;
+
+/// Spaces the authentication digits out.
+///
+/// They exist to be read aloud and compared by two people, and an unbroken run
+/// of six digits is exactly the shape people lose their place in halfway
+/// through. This is the whole defence against a man in the middle, so how easy
+/// it is to say is not cosmetic.
+fn spaced(digits: &str) -> String {
+    digits
+        .chars()
+        .map(|c| c.to_string())
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// How often the clock is refreshed.
+///
+/// Ten seconds for a display that only shows minutes: the point is that it
+/// never sits visibly wrong, not that it is precise.
+const CLOCK_INTERVAL_MS: u32 = 10_000;
+
+/// How often the battery is re-read.
+const BATTERY_INTERVAL_MS: u32 = 60_000;
+
+const WEEKDAYS: [&str; 7] = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
+const MONTHS: [&str; 12] = [
+    "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
+];
+
+/// The wall clock, as `23:18` and `Wed 19 Aug`.
+///
+/// Built here rather than left to the system furniture because this window runs
+/// fullscreen: on desktop that hides the taskbar and its clock outright, and a
+/// transfer over this link is measured in tens of minutes, which is long enough
+/// that whoever set it going will want to know how long they have been waiting.
+fn wall_clock() -> (String, String) {
+    let now = js_sys::Date::new_0();
+    let time = format!("{:02}:{:02}", now.get_hours(), now.get_minutes());
+    let date = format!(
+        "{} {} {}",
+        WEEKDAYS[(now.get_day() as usize) % 7],
+        now.get_date(),
+        MONTHS[(now.get_month() as usize) % 12],
+    );
+    (time, date)
+}
+
+/// Battery charge as a fraction, and whether it is on power.
+///
+/// Reached through `Reflect` rather than a typed binding: the Battery Status API
+/// is optional, and a platform that does not offer it should leave the readout
+/// absent rather than fail to build.
+async fn battery() -> Option<(f64, bool)> {
+    let nav = window().navigator();
+    let get: js_sys::Function = Reflect::get(&nav, &"getBattery".into())
+        .ok()?
+        .dyn_into()
+        .ok()?;
+    let promise: js_sys::Promise = get.call0(&nav).ok()?.dyn_into().ok()?;
+    let manager = JsFuture::from(promise).await.ok()?;
+
+    let level = Reflect::get(&manager, &"level".into()).ok()?.as_f64()?;
+    let charging = Reflect::get(&manager, &"charging".into())
+        .ok()?
+        .as_bool()
+        .unwrap_or(false);
+    Some((level, charging))
+}
+
+/// Where the chosen camera is remembered between runs.
+const CAMERA_KEY: &str = "lightgap.camera";
+
+/// And its label, which is what actually survives a restart.
+///
+/// Device ids do not. A browser may re-salt them between sessions, so the id
+/// saved yesterday can name nothing today — and asking for it with `exact`
+/// throws rather than degrading. The label ("camera 1, facing front") stays put,
+/// so it is what the preference is really keyed on; the id is a fast path for
+/// when it happens to still be valid.
+const CAMERA_LABEL_KEY: &str = "lightgap.camera.label";
+
+/// Where the display brightness is remembered between runs.
+const BRIGHTNESS_KEY: &str = "lightgap.brightness";
+
+/// Where the code's white level is remembered between runs.
+const CODE_LIGHT_KEY: &str = "lightgap.codelight";
+
+/// Dimmest the code is allowed to go, as a fraction of full white.
+///
+/// Deliberately far below what usually reads. Every step down narrows the gap
+/// between a light module and a dark one, and that gap is the decoder's entire
+/// signal — but where the useful bottom sits depends on the room, the sensor
+/// and how close the two devices are, and none of those are knowable from here.
+/// The range therefore goes well past the point of usefulness and says so,
+/// rather than stopping somewhere that only looks principled.
+const CODE_LIGHT_FLOOR: f32 = 0.08;
+
+/// Below this, the mask is usually too heavy to decode through.
+///
+/// A guide rather than a limit: a very dark room or a very close camera can go
+/// lower, which is exactly why this marks the value instead of capping it.
+const CODE_LIGHT_SAFE: f32 = 0.45;
+
+/// Pushes a brightness level down to the platform.
+///
+/// Fire and forget: the interface already shows the level it asked for, and a
+/// platform that refuses is one where the control is hidden anyway.
+fn apply_brightness(level: f32) {
+    spawn_local(async move {
+        let args = Object::new();
+        let _ = Reflect::set(&args, &"level".into(), &JsValue::from_f64(f64::from(level)));
+        invoke("set_brightness", args.into()).await;
+    });
+}
+
+fn remember(key: &str, value: &str) {
+    if let Ok(Some(store)) = window().local_storage() {
+        let _ = store.set_item(key, value);
+    }
+}
+
+fn recall(key: &str) -> Option<String> {
+    window()
+        .local_storage()
+        .ok()
+        .flatten()
+        .and_then(|store| store.get_item(key).ok().flatten())
+}
+
+fn forget(key: &str) {
+    if let Ok(Some(store)) = window().local_storage() {
+        let _ = store.remove_item(key);
+    }
+}
+
+/// Asks for a camera stream, optionally pinning one specific device.
+///
+/// Split out from the caller so the same request can be retried without the
+/// device pinned, which is what makes a remembered camera safe to ask for.
+async fn request_stream(device: Option<&str>) -> Result<web_sys::MediaStream, JsValue> {
+    let devices = window().navigator().media_devices()?;
+
+    let video_cfg = Object::new();
+    Reflect::set(&video_cfg, &"width".into(), &JsValue::from(CAPTURE_W))?;
+    Reflect::set(&video_cfg, &"height".into(), &JsValue::from(CAPTURE_H))?;
+    match device {
+        // An explicitly chosen device wins.
+        Some(id) => {
+            let exact = Object::new();
+            Reflect::set(&exact, &"exact".into(), &JsValue::from_str(id))?;
+            Reflect::set(&video_cfg, &"deviceId".into(), &exact.into())?;
+        }
+        // The front camera, and not because it is the better sensor — it is
+        // not. It is the one on the same face as the display.
+        //
+        // This application aims a *screen* at the peer, so that screen faces
+        // them and the rear camera necessarily faces away. Defaulting to
+        // "environment" pointed the only camera that matters at whatever
+        // happened to be behind the device.
+        //
+        // facingMode is only a hint in any case: on a desktop with several
+        // cameras attached it selects nothing at all, which is what the picker
+        // is for.
+        None => {
+            Reflect::set(&video_cfg, &"facingMode".into(), &"user".into())?;
+        }
+    }
+
+    let constraints = Object::new();
+    Reflect::set(&constraints, &"video".into(), &video_cfg.into())?;
+    Reflect::set(&constraints, &"audio".into(), &JsValue::FALSE)?;
+    let constraints: web_sys::MediaStreamConstraints = constraints.unchecked_into();
+
+    let stream = JsFuture::from(devices.get_user_media_with_constraints(&constraints)?).await?;
+    Ok(stream.unchecked_into())
+}
 
 /// The video inputs this machine offers, as (device id, label).
 ///
@@ -123,6 +300,8 @@ struct Status {
     session_state: String,
     role: Option<String>,
     peer_found: bool,
+    sees_peer: bool,
+    peer_sees_us: bool,
     sending: Option<String>,
     send_progress: f32,
     receiving: Option<String>,
@@ -132,18 +311,10 @@ struct Status {
     advice: String,
     pixels_per_module: f32,
     payload_per_frame: usize,
+    sas: Option<String>,
+    pairing_expires_in: Option<u64>,
     metrics: Metrics,
     log: Vec<String>,
-}
-
-#[derive(Debug, Clone, Deserialize)]
-struct FrameOutcome {
-    #[allow(dead_code)]
-    found_code: bool,
-    #[allow(dead_code)]
-    decoded: bool,
-    #[allow(dead_code)]
-    decode_ms: f32,
 }
 
 /// Rolling mean, so the timings do not flicker.
@@ -181,11 +352,9 @@ fn now_ms() -> f64 {
 /// raw binary body, and that only happens when the typed array is the entire
 /// invoke argument. Passing them as a second argument would wrap the pixels in
 /// an object and send each one through JSON as a number.
-fn rgba_to_grey_with_header(rgba: &[u8], width: u32, height: u32) -> Vec<u8> {
+fn rgba_to_grey(rgba: &[u8], width: u32, height: u32) -> Vec<u8> {
     let px = (width as usize) * (height as usize);
-    let mut out = Vec::with_capacity(8 + px);
-    out.extend_from_slice(&width.to_le_bytes());
-    out.extend_from_slice(&height.to_le_bytes());
+    let mut out = Vec::with_capacity(px);
     for i in 0..px {
         let r = rgba[i * 4] as u32;
         let g = rgba[i * 4 + 1] as u32;
@@ -212,6 +381,27 @@ const BTN_PRIMARY: &str = "min-h-10 cursor-pointer rounded-lg border border-gold
                            disabled:cursor-default disabled:opacity-35 \
                            disabled:hover:border-gold/50 disabled:hover:bg-gold/15";
 
+/// One half of the link check.
+///
+/// Two of these rather than one, because the link fails one direction at a time
+/// and a single "connected" light would hide which. Ticked on one side and not
+/// the other says plainly which device to move.
+#[component]
+fn LinkCheck(label: &'static str, #[prop(into)] ok: Signal<bool>) -> impl IntoView {
+    view! {
+        <span
+            class="flex items-center gap-1.5 transition-colors"
+            class=("text-verified", move || ok.get())
+            class=("text-dim", move || !ok.get())
+        >
+            <span class="text-sm leading-none">
+                {move || if ok.get() { "✓" } else { "○" }}
+            </span>
+            {label}
+        </span>
+    }
+}
+
 /// One line of the live measurement panel.
 #[component]
 fn Metric(label: &'static str, #[prop(into)] value: Signal<String>) -> impl IntoView {
@@ -231,11 +421,21 @@ pub fn App() -> impl IntoView {
     let (qr, set_qr) = signal(String::new());
     let (status, set_status) = signal(Status::default());
     let (camera_on, set_camera_on) = signal(false);
+    // Distinct from `camera_on`, which turns true the moment opening *starts*.
+    // A video element with no source yet paints its own oversized play control,
+    // so the gap between asking for a camera and getting one is exactly the
+    // window in which it must stay hidden.
+    let (streaming, set_streaming) = signal(false);
     let (message, set_message) = signal(String::new());
     let (capture_ms, set_capture_ms) = signal(0.0f64);
     let (transport_ms, set_transport_ms) = signal(0.0f64);
     let (cameras, set_cameras) = signal(Vec::<(String, String)>::new());
     let (camera_id, set_camera_id) = signal(Option::<String>::None);
+    let (dimmable, set_dimmable) = signal(false);
+    let (code_light, set_code_light) = signal(1.0f32);
+    let (clock, set_clock) = signal(wall_clock());
+    let (charge, set_charge) = signal(Option::<(f64, bool)>::None);
+    let (brightness, set_brightness) = signal(1.0f32);
 
     // --- the displayed code -------------------------------------------------
     spawn_local(async move {
@@ -263,7 +463,74 @@ pub fn App() -> impl IntoView {
     // Read up front, so the picker is populated before the camera is ever
     // opened rather than only after.
     spawn_local(async move {
-        set_cameras.set(enumerate_cameras().await);
+        loop {
+            set_clock.set(wall_clock());
+            gloo_timers::future::TimeoutFuture::new(CLOCK_INTERVAL_MS).await;
+        }
+    });
+
+    spawn_local(async move {
+        loop {
+            set_charge.set(battery().await);
+            gloo_timers::future::TimeoutFuture::new(BATTERY_INTERVAL_MS).await;
+        }
+    });
+
+    // Asked once. Where the platform does not hand out the control there is no
+    // slider, rather than a slider that silently does nothing.
+    spawn_local(async move {
+        let ok = invoke("brightness_controllable", JsValue::UNDEFINED)
+            .await
+            .as_bool()
+            .unwrap_or(false);
+        set_dimmable.set(ok);
+        if ok {
+            let level = recall(BRIGHTNESS_KEY)
+                .and_then(|v| v.parse::<f32>().ok())
+                .unwrap_or(1.0);
+            set_brightness.set(level);
+            apply_brightness(level);
+        }
+    });
+
+    if let Some(level) = recall(CODE_LIGHT_KEY).and_then(|v| v.parse::<f32>().ok()) {
+        set_code_light.set(level.clamp(CODE_LIGHT_FLOOR, 1.0));
+    }
+
+    let on_code_light = move |ev| {
+        let raw = event_target_value(&ev);
+        let Ok(level) = raw.parse::<f32>() else {
+            return;
+        };
+        set_code_light.set(level);
+        remember(CODE_LIGHT_KEY, &raw);
+    };
+
+    let on_brightness = move |ev| {
+        let raw = event_target_value(&ev);
+        let Ok(level) = raw.parse::<f32>() else {
+            return;
+        };
+        set_brightness.set(level);
+        remember(BRIGHTNESS_KEY, &raw);
+        apply_brightness(level);
+    };
+
+    // The window opens fullscreen every time, so there has to be a way out that
+    // is not killing the process.
+    let _ = window_event_listener(ev::keydown, move |e| match e.key().as_str() {
+        "F11" => {
+            e.prevent_default();
+            spawn_local(async {
+                invoke("toggle_fullscreen", JsValue::UNDEFINED).await;
+            });
+        }
+        "Escape" => {
+            spawn_local(async {
+                invoke("leave_fullscreen", JsValue::UNDEFINED).await;
+            });
+        }
+        _ => {}
     });
 
     let open_camera = move || {
@@ -274,56 +541,35 @@ pub fn App() -> impl IntoView {
         set_message.set("opening camera...".into());
 
         spawn_local(async move {
-            let devices = match window().navigator().media_devices() {
-                Ok(d) => d,
-                Err(e) => {
-                    set_message.set(format!("no camera available: {e:?}"));
-                    set_camera_on.set(false);
-                    return;
+            let wanted = camera_id.get_untracked();
+            let stream = match request_stream(wanted.as_deref()).await {
+                Ok(s) => Some(s),
+                Err(first) => {
+                    if wanted.is_some() {
+                        // The remembered camera would not open — unplugged, in
+                        // use, or named by an id that has since gone stale.
+                        // Fall back for this session, but keep the preference:
+                        // erasing it here is what made the setting look like it
+                        // never saved at all, because one bad start was enough
+                        // to lose it permanently. The label is still on file and
+                        // the next start resolves it again.
+                        set_camera_id.set(None);
+                        request_stream(None).await.ok()
+                    } else {
+                        set_message.set(format!("camera unavailable: {first:?}"));
+                        None
+                    }
                 }
             };
 
-            let video_cfg = Object::new();
-            let _ = Reflect::set(&video_cfg, &"width".into(), &JsValue::from(CAPTURE_W));
-            let _ = Reflect::set(&video_cfg, &"height".into(), &JsValue::from(CAPTURE_H));
-            // An explicitly chosen device wins. facingMode is only a hint, and
-            // on a desktop with several cameras attached it selects nothing at
-            // all — which is the case the picker exists for. It stays as the
-            // fallback because on a phone it is the right default: the rear
-            // camera is far better than the front one, and it is the one that
-            // gets aimed at the peer.
-            match camera_id.get_untracked() {
-                Some(id) => {
-                    let exact = Object::new();
-                    let _ = Reflect::set(&exact, &"exact".into(), &JsValue::from_str(&id));
-                    let _ = Reflect::set(&video_cfg, &"deviceId".into(), &exact.into());
+            let Some(stream) = stream else {
+                set_camera_on.set(false);
+                set_streaming.set(false);
+                if message.get_untracked().is_empty() {
+                    set_message.set("camera unavailable".into());
                 }
-                None => {
-                    let _ = Reflect::set(&video_cfg, &"facingMode".into(), &"environment".into());
-                }
-            }
-            let constraints = Object::new();
-            let _ = Reflect::set(&constraints, &"video".into(), &video_cfg.into());
-            let _ = Reflect::set(&constraints, &"audio".into(), &JsValue::FALSE);
-            let constraints: web_sys::MediaStreamConstraints = constraints.unchecked_into();
-
-            let promise = match devices.get_user_media_with_constraints(&constraints) {
-                Ok(p) => p,
-                Err(e) => {
-                    set_message.set(format!("camera refused: {e:?}"));
-                    set_camera_on.set(false);
-                    return;
-                }
+                return;
             };
-            let stream = match JsFuture::from(promise).await {
-                Ok(s) => s,
-                Err(e) => {
-                    set_message.set(format!("camera permission denied: {e:?}"));
-                    set_camera_on.set(false);
-                    return;
-                }
-            };
-            let stream: web_sys::MediaStream = stream.unchecked_into();
 
             let Some(video) = video_ref.get_untracked() else {
                 set_message.set("the video element is missing".into());
@@ -332,6 +578,7 @@ pub fn App() -> impl IntoView {
             };
             video.set_src_object(Some(&stream));
             let _ = video.play();
+            set_streaming.set(true);
             set_message.set(String::new());
 
             // Permission now exists, so the devices have readable names. Until
@@ -354,8 +601,16 @@ pub fn App() -> impl IntoView {
                 canvas.set_width(CAPTURE_W);
                 canvas.set_height(CAPTURE_H);
 
+                // `willReadFrequently` matters here more than it usually does.
+                // This loop does nothing but read the canvas back out again,
+                // and without the hint the browser keeps the surface on the GPU
+                // and pays a stall on every `getImageData`. The frame is drawn
+                // once and read once, several times a second, which is the
+                // exact pattern the flag exists for.
+                let opts = Object::new();
+                let _ = Reflect::set(&opts, &"willReadFrequently".into(), &JsValue::TRUE);
                 let ctx = canvas
-                    .get_context("2d")
+                    .get_context_with_context_options("2d", &opts)
                     .ok()
                     .flatten()
                     .and_then(|c| c.dyn_into::<web_sys::CanvasRenderingContext2d>().ok());
@@ -385,26 +640,38 @@ pub fn App() -> impl IntoView {
                     continue;
                 };
                 let rgba = image_data.data();
-                let grey = rgba_to_grey_with_header(&rgba, CAPTURE_W, CAPTURE_H);
+                let grey = rgba_to_grey(&rgba, CAPTURE_W, CAPTURE_H);
                 r_capture.push(now_ms() - t_capture);
 
-                // The typed array goes across ALONE. Nesting it in an object
-                // would send it through JSON.stringify, turning every pixel into
-                // a number in text: roughly four megabytes per frame instead of
-                // nine hundred kilobytes.
-                let t_transport = now_ms();
-                let buf = Uint8Array::new_with_length(grey.len() as u32);
-                buf.copy_from(&grey);
-                let res = invoke("on_frame", buf.into()).await;
-                let elapsed = now_ms() - t_transport;
+                // The decode happens here, in front of the boundary rather than
+                // behind it. Nine hundred kilobytes of pixels per frame used to
+                // cross as a raw binary body, which worked on desktop and never
+                // could on Android: its WebView does not expose request bodies,
+                // so Tauri falls back to a text channel and the frame arrives as
+                // anything but bytes. What crosses now is what the decode
+                // produced, which is under a hundred bytes.
+                let t_decode = now_ms();
+                let scan = optical_codec::decode::scan_greyscale(
+                    CAPTURE_W as usize,
+                    CAPTURE_H as usize,
+                    &grey,
+                );
+                let decode_ms = now_ms() - t_decode;
 
-                if let Ok(outcome) = serde_wasm_bindgen::from_value::<FrameOutcome>(res) {
-                    // What is attributable to transport is the wall clock minus
-                    // what the backend reports having spent scanning. Keeping
-                    // them apart is what says which fallback to reach for if the
-                    // loop turns out too slow.
-                    r_transport.push((elapsed - f64::from(outcome.decode_ms)).max(0.0));
-                }
+                let t_transport = now_ms();
+                let args = Object::new();
+                let Ok(scan_js) = serde_wasm_bindgen::to_value(&scan) else {
+                    gloo_timers::future::TimeoutFuture::new(SCAN_INTERVAL_MS).await;
+                    continue;
+                };
+                let _ = Reflect::set(&args, &"scan".into(), &scan_js);
+                let _ = Reflect::set(&args, &"decodeMs".into(), &JsValue::from_f64(decode_ms));
+                let _ = invoke("on_scan", args.into()).await;
+
+                // Transport is now transport alone: the decode is timed on this
+                // side and reported separately, so neither number hides inside
+                // the other.
+                r_transport.push(now_ms() - t_transport);
 
                 tick += 1;
                 if tick.is_multiple_of(5) {
@@ -419,6 +686,7 @@ pub fn App() -> impl IntoView {
 
     let close_camera = move || {
         set_camera_on.set(false);
+        set_streaming.set(false);
         if let Some(video) = video_ref.get_untracked() {
             release_stream(&video);
         }
@@ -427,13 +695,64 @@ pub fn App() -> impl IntoView {
     let start_camera = move |_| open_camera();
     let stop_camera = move |_| close_camera();
 
+    // Restore the camera, then open it, in that order and in one task.
+    //
+    // The order is the point. `open_camera` reads the remembered device, so
+    // splitting these across two tasks would race: whichever resolved first
+    // would win, and the app would open the right camera or the default one
+    // depending on how quickly the device list came back.
+    //
+    // It opens by itself because there is no version of using this application
+    // where the camera should stay off — without it there is no link, only half
+    // a link that cannot hear the answer. The button remains, as a way to
+    // restart the camera rather than as a step to remember.
+    spawn_local(async move {
+        let found = enumerate_cameras().await;
+
+        // Resolve the remembered camera against what is actually attached, by
+        // label first. Once permission has been granted the labels come back
+        // real, and matching on one recovers a device whose id has changed
+        // underneath us — which is the ordinary case, not the exotic one.
+        let wanted = recall(CAMERA_LABEL_KEY)
+            .and_then(|label| {
+                found
+                    .iter()
+                    .find(|(_, l)| *l == label)
+                    .map(|(id, _)| id.clone())
+            })
+            .or_else(|| {
+                // No label match. Fall back to the saved id, but only if the
+                // list actually contains it: asking for one that is gone throws
+                // instead of degrading.
+                let saved = recall(CAMERA_KEY)?;
+                let (id, label) = found.iter().find(|(id, _)| *id == saved)?;
+                // Heal a preference written before labels were stored, so it
+                // survives the next time this id is re-salted instead of
+                // silently reverting to the default one more time.
+                remember(CAMERA_LABEL_KEY, label);
+                Some(id.clone())
+            });
+
+        set_cameras.set(found);
+        if wanted.is_some() {
+            set_camera_id.set(wanted);
+        }
+        open_camera();
+    });
+
     let pick_camera = move |ev| {
         let chosen = event_target_value(&ev);
-        set_camera_id.set(if chosen.is_empty() {
-            None
+        if chosen.is_empty() {
+            forget(CAMERA_KEY);
+            forget(CAMERA_LABEL_KEY);
+            set_camera_id.set(None);
         } else {
-            Some(chosen)
-        });
+            remember(CAMERA_KEY, &chosen);
+            if let Some((_, label)) = cameras.get_untracked().iter().find(|(id, _)| *id == chosen) {
+                remember(CAMERA_LABEL_KEY, label);
+            }
+            set_camera_id.set(Some(chosen));
+        }
 
         // Switching while running has to close the old device first. The delay
         // is not politeness: the capture loop needs a tick to notice it should
@@ -498,51 +817,217 @@ pub fn App() -> impl IntoView {
     };
 
     view! {
-        <main class="min-h-screen bg-ground text-ink antialiased">
-            <div class="mx-auto flex max-w-6xl flex-col gap-4 p-4">
+        // The page itself never scrolls. On this application the code is the
+        // transmitter, and a transmitter that can be scrolled off screen is one
+        // that stops transmitting because somebody brushed the trackpad.
+        <main class="h-screen overflow-hidden bg-ground text-ink antialiased">
+            // Padded past the system bars. The Android activity draws edge
+            // to edge, so without this the status bar sits on top of the
+            // header rather than beside it.
+            <div
+                class="mx-auto flex h-full max-w-[110rem] flex-col gap-2 p-2 sm:gap-3 sm:p-4 \
+                       pt-[max(0.5rem,env(safe-area-inset-top))] \
+                       pb-[max(0.5rem,env(safe-area-inset-bottom))] \
+                       pl-[max(0.5rem,env(safe-area-inset-left))] \
+                       pr-[max(0.5rem,env(safe-area-inset-right))]"
+            >
 
-                <header class="flex flex-col gap-1">
-                    <div class="flex flex-wrap items-center gap-x-3 gap-y-1">
-                        <span class="h-3 w-3 shrink-0 rounded-full bg-gold"></span>
-                        <h1 class="text-base font-semibold tracking-wide">"Lightgap"</h1>
-                        <span
-                            class="rounded-full border border-line px-2 py-0.5 text-xs \
-                                   tabular-nums text-dim transition-colors"
-                            class=("border-verified/50", move || status.get().peer_found)
-                            class=("text-verified", move || status.get().peer_found)
-                        >
-                            {move || {
-                                let s = status.get();
-                                match s.role {
-                                    Some(r) => format!("{} · {}", s.session_state, r),
-                                    None => s.session_state,
-                                }
-                            }}
-                        </span>
-                    </div>
+                <header class="flex flex-none flex-wrap items-baseline gap-x-3 gap-y-1">
+                    <span class="h-2.5 w-2.5 shrink-0 self-center rounded-full bg-gold"></span>
+                    <h1 class="text-sm font-semibold tracking-wide sm:text-base">"Lightgap"</h1>
+                    <span
+                        class="rounded-full border border-line px-2 py-0.5 text-xs tabular-nums \
+                               text-dim transition-colors"
+                        class=("border-verified/50", move || status.get().peer_found)
+                        class=("text-verified", move || status.get().peer_found)
+                    >
+                        {move || {
+                            let s = status.get();
+                            match s.role {
+                                Some(r) => format!("{} · {}", s.session_state, r),
+                                None => s.session_state,
+                            }
+                        }}
+                    </span>
 
-                    // Aiming guidance sits directly under the title because it
-                    // is the one line worth reading while holding two devices
-                    // up at each other.
+                    // The one line worth reading while holding two devices up
+                    // at each other, so it sits on the top line rather than
+                    // below the fold.
                     <p
-                        class="text-sm text-dim transition-colors"
+                        class="text-xs text-dim transition-colors sm:text-sm"
                         class=("text-verified", move || status.get().peer_found)
                     >
                         {move || status.get().advice}
                     </p>
+
+                    // Pushed to the right: the clock, the charge and the way
+                    // out of fullscreen. None of it is about the link, and all
+                    // of it is what the system furniture would have shown if
+                    // this window were not covering it.
+                    <div
+                        class="ml-auto flex items-baseline gap-x-3 text-xs \
+                               tabular-nums text-dim/70"
+                    >
+                        <Show when=move || charge.get().is_some()>
+                            {move || {
+                                let (level, charging) = charge.get().unwrap_or((0.0, false));
+                                let mark = if charging { "⚡" } else { "" };
+                                view! {
+                                    <span
+                                        class="text-dim"
+                                        class=(
+                                            "text-misread",
+                                            move || !charging && level < 0.15,
+                                        )
+                                    >
+                                        {format!("{mark}{:.0}%", level * 100.0)}
+                                    </span>
+                                }
+                            }}
+                        </Show>
+                        <span class="hidden text-dim sm:inline">
+                            {move || clock.get().1}
+                        </span>
+                        <span class="text-sm font-medium text-ink">
+                            {move || clock.get().0}
+                        </span>
+                    </div>
                 </header>
 
-                <section class="grid grid-cols-1 items-start gap-4 lg:grid-cols-[1.6fr_1fr]">
+                // Portrait stacks with the code on top; landscape puts the code
+                // beside everything else. The split is by orientation and not by
+                // width because what actually constrains the code is the shorter
+                // side of the screen, whatever the device calls itself.
+                <section
+                    class="grid min-h-0 flex-1 gap-2 sm:gap-3 \
+                           portrait:grid-rows-[minmax(0,1fr)_auto] \
+                           landscape:grid-cols-[minmax(0,1fr)_minmax(17rem,21rem)]"
+                >
 
-                    <div class="flex flex-col gap-3">
-                        // White, always, and never tinted by the theme: this is
-                        // the transmitter, and its contrast IS the link's
-                        // signal-to-noise ratio.
+                    <div class="flex min-h-0 flex-col items-center justify-center gap-2">
+                        // Sized against the viewport height, not just the column
+                        // width. Payload per frame rises with how many camera
+                        // pixels land on each module, so leaving the code small
+                        // while the screen has room to spare costs throughput
+                        // directly — which is why nothing here caps the layout
+                        // at a comfortable reading width.
+                        // Three layers, in this order: the code, then a mask
+                        // in front of the whole of it.
+                        //
+                        // The mask is a separate element rather than a change to
+                        // the pane's own colour because it has to sit over the
+                        // modules as well as the field they are drawn on — the
+                        // code is handed in as markup through `inner_html`,
+                        // which replaces whatever children this element has, so
+                        // the mask cannot live inside it.
                         <div
-                            class="flex aspect-square items-center justify-center rounded-xl \
-                                   bg-white p-3 [&>svg]:block [&>svg]:h-full [&>svg]:w-full"
-                            inner_html=move || qr.get()
-                        ></div>
+                            class="relative aspect-square w-[min(100%,46vh)] shrink-0 \
+                                   landscape:w-[min(100%,74vh)]"
+                        >
+                            <div
+                                class="absolute inset-0 rounded-xl bg-white p-2 sm:p-3 \
+                                       [&>svg]:block [&>svg]:h-full [&>svg]:w-full"
+                                inner_html=move || qr.get()
+                            ></div>
+
+                            // Never intercepts a click: it covers the one thing
+                            // on screen that must not stop being a display.
+                            <div
+                                class="pointer-events-none absolute inset-0 rounded-xl"
+                                style=move || {
+                                    format!(
+                                        "background-color: rgba(0, 0, 0, {:.2})",
+                                        1.0 - code_light.get(),
+                                    )
+                                }
+                            ></div>
+                        </div>
+
+                        <Show when=move || status.get().sas.is_some()>
+                            <div
+                                class="w-full max-w-md rounded-xl border border-gold/50 \
+                                       bg-gold/10 px-3 py-2 text-center"
+                            >
+                                <p class="text-[0.7rem] tracking-wide text-dim">
+                                    "Compare these digits on both screens"
+                                </p>
+                                <p
+                                    class="font-mono text-xl font-semibold tracking-[0.3em] \
+                                           tabular-nums text-gold sm:text-2xl"
+                                >
+                                    {move || spaced(&status.get().sas.unwrap_or_default())}
+                                </p>
+                                <p class="text-[0.7rem] text-dim">
+                                    "If they differ, something is between you."
+                                </p>
+                            </div>
+                        </Show>
+
+                        <Show when=move || status.get().pairing_expires_in.is_some()>
+                            <p class="text-center text-xs text-dim">
+                                "Pairing code · new key in "
+                                {move || {
+                                    format!("{} s", status.get().pairing_expires_in.unwrap_or(0))
+                                }}
+                            </p>
+                        </Show>
+                    </div>
+
+                    // Everything that is not the transmitter. Scrolls on its
+                    // own so that running out of room here can never shrink the
+                    // code.
+                    <aside
+                        class="flex min-h-0 flex-col gap-2 overflow-y-auto \
+                               portrait:max-h-[42vh]"
+                    >
+                        <div
+                            class="relative aspect-video w-full shrink-0 overflow-hidden \
+                                   rounded-xl border border-line bg-black"
+                        >
+                            // Hidden rather than merely covered while off: an
+                            // empty video element paints its own oversized play
+                            // control, which reads as a button to press and sits
+                            // on top of the text explaining what to do instead.
+                            <video
+                                class="h-full w-full object-cover"
+                                class=("hidden", move || !streaming.get())
+                                node_ref=video_ref
+                                autoplay=true
+                                muted=true
+                                playsinline=true
+                            ></video>
+                            <Show when=move || !camera_on.get()>
+                                <div
+                                    class="absolute inset-0 flex items-center justify-center p-3 \
+                                           text-center text-xs text-dim sm:text-sm"
+                                >
+                                    "Point this camera at the other screen"
+                                </div>
+                            </Show>
+                        </div>
+
+                        // Sits directly under the preview because this is
+                        // what you read while moving the devices, not after.
+                        <div
+                            class="flex items-center justify-between gap-3 rounded-xl border \
+                                   border-line bg-panel px-3 py-2 text-xs"
+                            class=(
+                                "border-verified/50",
+                                move || {
+                                    let s = status.get();
+                                    s.sees_peer && s.peer_sees_us
+                                },
+                            )
+                        >
+                            <LinkCheck
+                                label="You see them"
+                                ok=Signal::derive(move || status.get().sees_peer)
+                            />
+                            <LinkCheck
+                                label="They see you"
+                                ok=Signal::derive(move || status.get().peer_sees_us)
+                            />
+                        </div>
 
                         <div class="flex flex-wrap gap-2">
                             <button
@@ -552,12 +1037,31 @@ pub fn App() -> impl IntoView {
                             >
                                 "Start camera"
                             </button>
+                            <button
+                                class=BTN
+                                on:click=stop_camera
+                                disabled=move || !camera_on.get()
+                            >
+                                "Stop"
+                            </button>
                             <select
-                                class="min-h-10 max-w-56 cursor-pointer rounded-lg border \
+                                class="min-h-10 min-w-0 flex-1 cursor-pointer rounded-lg border \
                                        border-line bg-panel px-2.5 text-sm text-ink \
                                        transition-colors hover:border-beam"
                                 on:change=pick_camera
-                                prop:value=move || camera_id.get().unwrap_or_default()
+                                // Reads `cameras` as well as the value itself,
+                                // and not by accident. A select ignores a value
+                                // that names no option it has yet, and the
+                                // options arrive from an async enumeration —
+                                // so without a dependency on the list this runs
+                                // once against an empty select, silently does
+                                // nothing, and never runs again. The remembered
+                                // camera was being used all along and just
+                                // never shown.
+                                prop:value=move || {
+                                    let _ = cameras.get();
+                                    camera_id.get().unwrap_or_default()
+                                }
                             >
                                 <option value="">"Default camera"</option>
                                 {move || {
@@ -570,14 +1074,77 @@ pub fn App() -> impl IntoView {
                                         .collect_view()
                                 }}
                             </select>
-                            <button
-                                class=BTN
-                                on:click=stop_camera
-                                disabled=move || !camera_on.get()
-                            >
-                                "Stop"
-                            </button>
                         </div>
+
+                        // Two light controls, and they are not the same lever.
+                        //
+                        // This one drives a mask laid over the whole code. It
+                        // works on every display and touches nothing outside the
+                        // window, and it is aimed squarely at blooming, because
+                        // the light half of the image is what a close-up sensor
+                        // clips on. It costs contrast, so it is a fix for a
+                        // specific failure rather than a dial to leave low.
+                        //
+                        // The one below moves the panel backlight, which lowers
+                        // white and black together and so keeps the ratio. That
+                        // is the better lever where it exists — but on desktop
+                        // it exists only sometimes: this machine can set its
+                        // built-in panel and cannot touch the external monitor
+                        // beside it, so offering it there would be a control
+                        // that works or not depending on which screen the window
+                        // happens to be on.
+                        <div class="rounded-xl border border-line bg-panel px-3 py-2">
+                            <div class="flex items-baseline justify-between text-xs">
+                                <span class="text-dim">"Code brightness"</span>
+                                <span
+                                    class="tabular-nums text-ink"
+                                    class=(
+                                        "text-misread",
+                                        move || code_light.get() < CODE_LIGHT_SAFE,
+                                    )
+                                >
+                                    {move || format!("{:.0}%", code_light.get() * 100.0)}
+                                </span>
+                            </div>
+                            <input
+                                class="mt-1 w-full accent-gold"
+                                type="range"
+                                min="0.08"
+                                max="1"
+                                step="0.01"
+                                prop:value=move || code_light.get().to_string()
+                                on:input=on_code_light
+                            />
+                            <p class="mt-1 text-[0.7rem] text-dim/70">
+                                {move || {
+                                    if code_light.get() < CODE_LIGHT_SAFE {
+                                        "Below what usually decodes — watch the read rate"
+                                    } else {
+                                        "Lower it if the peer sees the code but cannot read it"
+                                    }
+                                }}
+                            </p>
+                        </div>
+
+                        <Show when=move || dimmable.get()>
+                            <div class="rounded-xl border border-line bg-panel px-3 py-2">
+                                <div class="flex items-baseline justify-between text-xs">
+                                    <span class="text-dim">"Screen backlight"</span>
+                                    <span class="tabular-nums text-ink">
+                                        {move || format!("{:.0}%", brightness.get() * 100.0)}
+                                    </span>
+                                </div>
+                                <input
+                                    class="mt-1 w-full accent-gold"
+                                    type="range"
+                                    min="0.05"
+                                    max="1"
+                                    step="0.05"
+                                    prop:value=move || brightness.get().to_string()
+                                    on:input=on_brightness
+                                />
+                            </div>
+                        </Show>
 
                         <div class="flex flex-wrap gap-2">
                             <button class=BTN on:click=pick_and_send>"Send a file…"</button>
@@ -592,40 +1159,38 @@ pub fn App() -> impl IntoView {
                         </div>
 
                         <Show when=move || !message.get().is_empty()>
-                            <p class="rounded border-l-2 border-beam bg-panel px-3 py-2 text-sm">
+                            <p class="rounded border-l-2 border-beam bg-panel px-3 py-2 text-xs">
                                 {move || message.get()}
                             </p>
                         </Show>
 
                         <Show when=move || status.get().sending.is_some()>
-                            <div class="flex items-center gap-3 text-sm">
-                                <span class="min-w-36 truncate text-dim">
-                                    "Sending "
-                                    {move || status.get().sending.unwrap_or_default()}
+                            <div class="flex items-center gap-2 text-xs">
+                                <span class="min-w-0 flex-1 truncate text-dim">
+                                    "Sending " {move || status.get().sending.unwrap_or_default()}
                                 </span>
                                 <progress
-                                    class="h-2 flex-1 accent-gold"
+                                    class="h-2 w-20 accent-gold"
                                     max="1"
                                     value=move || status.get().send_progress
                                 ></progress>
-                                <span class="w-12 text-right tabular-nums text-dim">
+                                <span class="w-9 text-right tabular-nums text-dim">
                                     {move || percent(status.get().send_progress)}
                                 </span>
                             </div>
                         </Show>
 
                         <Show when=move || status.get().receiving.is_some()>
-                            <div class="flex items-center gap-3 text-sm">
-                                <span class="min-w-36 truncate text-dim">
-                                    "Receiving "
-                                    {move || status.get().receiving.unwrap_or_default()}
+                            <div class="flex items-center gap-2 text-xs">
+                                <span class="min-w-0 flex-1 truncate text-dim">
+                                    "Receiving " {move || status.get().receiving.unwrap_or_default()}
                                 </span>
                                 <progress
-                                    class="h-2 flex-1 accent-beam"
+                                    class="h-2 w-20 accent-beam"
                                     max="1"
                                     value=move || status.get().receive_progress
                                 ></progress>
-                                <span class="w-12 text-right tabular-nums text-dim">
+                                <span class="w-9 text-right tabular-nums text-dim">
                                     {move || percent(status.get().receive_progress)}
                                 </span>
                             </div>
@@ -634,7 +1199,7 @@ pub fn App() -> impl IntoView {
                         <Show when=move || status.get().received_name.is_some()>
                             <div
                                 class="rounded border-l-2 border-verified bg-panel px-3 py-2 \
-                                       text-sm"
+                                       text-xs"
                             >
                                 {move || {
                                     let s = status.get();
@@ -646,38 +1211,16 @@ pub fn App() -> impl IntoView {
                                 }}
                             </div>
                         </Show>
-                    </div>
 
-                    <div class="flex flex-col gap-3">
-                        // Not decoration: without it there is no way to tell
-                        // whether the peer's code is framed, in focus, or in
-                        // view at all.
+                        // Two columns where the panel is wide and one where it
+                        // is a narrow side rail. Always visible either way:
+                        // these numbers are how anyone tells a link aimed wrong
+                        // from one aimed right and too dense, and that is read
+                        // while moving the devices, not afterwards.
                         <div
-                            class="relative aspect-video overflow-hidden rounded-xl border \
-                                   border-line bg-black"
-                        >
-                            <video
-                                class="h-full w-full object-cover"
-                                node_ref=video_ref
-                                autoplay=true
-                                muted=true
-                            ></video>
-                            <Show when=move || !camera_on.get()>
-                                <div
-                                    class="absolute inset-0 flex items-center justify-center \
-                                           p-4 text-center text-sm text-dim"
-                                >
-                                    "Point this device's camera at the other one's screen"
-                                </div>
-                            </Show>
-                        </div>
-
-                        // Always visible rather than behind a panel. These
-                        // numbers are how anyone tells a link that is aimed
-                        // wrong from one that is aimed right and too dense.
-                        <div
-                            class="divide-y divide-line/60 rounded-xl border border-line \
-                                   bg-panel px-3 py-1 text-sm"
+                            class="grid grid-cols-2 gap-x-4 rounded-xl border border-line \
+                                   bg-panel px-3 py-2 text-xs landscape:grid-cols-1 \
+                                   landscape:text-sm"
                         >
                             <Metric
                                 label="Read rate"
@@ -738,33 +1281,34 @@ pub fn App() -> impl IntoView {
                                 })
                             />
                             <Metric
-                                label="Codes displayed"
+                                label="Codes shown"
                                 value=Signal::derive(move || {
                                     format!("{}", status.get().metrics.frames_displayed)
                                 })
                             />
                         </div>
-                    </div>
+
+                        <details
+                            class="shrink-0 rounded-xl border border-line bg-panel px-3 py-2 \
+                                   text-xs"
+                        >
+                            <summary class="cursor-pointer text-dim">"History"</summary>
+                            <ul class="mt-2 max-h-40 list-disc overflow-y-auto pl-5">
+                                {move || {
+                                    status
+                                        .get()
+                                        .log
+                                        .into_iter()
+                                        .rev()
+                                        .map(|line| view! { <li class="py-0.5 text-dim">{line}</li> })
+                                        .collect_view()
+                                }}
+                            </ul>
+                        </details>
+                    </aside>
                 </section>
 
                 <canvas node_ref=canvas_ref class="hidden"></canvas>
-
-                <details class="rounded-xl border border-line bg-panel px-3 py-2 text-sm">
-                    <summary class="cursor-pointer text-dim">"History"</summary>
-                    <ul class="mt-2 max-h-48 list-disc overflow-y-auto pl-5">
-                        {move || {
-                            status
-                                .get()
-                                .log
-                                .into_iter()
-                                .rev()
-                                .map(|line| {
-                                    view! { <li class="py-0.5 text-dim">{line}</li> }
-                                })
-                                .collect_view()
-                        }}
-                    </ul>
-                </details>
             </div>
         </main>
     }

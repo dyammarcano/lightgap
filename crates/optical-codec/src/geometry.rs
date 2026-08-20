@@ -8,7 +8,7 @@
 //! wrong.
 
 /// A point in frame coordinates.
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(serde::Serialize, serde::Deserialize, Debug, Clone, Copy, PartialEq)]
 pub struct Point {
     pub x: f32,
     pub y: f32,
@@ -23,7 +23,7 @@ impl Point {
 }
 
 /// Where and how the code is seen.
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(serde::Serialize, serde::Deserialize, Debug, Clone, Copy, PartialEq)]
 pub struct QrGeometry {
     /// Corners in order: top-left, top-right, bottom-right, bottom-left.
     pub corners: [Point; 4],

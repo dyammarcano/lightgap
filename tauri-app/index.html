@@ -2,6 +2,14 @@
 <html>
   <head>
     <meta charset="utf-8" />
+    <!-- viewport-fit=cover is what makes env(safe-area-inset-*) report real
+         numbers. Without it the Android status bar draws straight over the
+         header, because the activity goes edge to edge and nothing tells the
+         page where the system furniture is. -->
+    <meta
+      name="viewport"
+      content="width=device-width, initial-scale=1, viewport-fit=cover"
+    />
     <title>Lightgap</title>
     <link data-trunk rel="tailwind-css" href="tailwind.css" />
     <link data-trunk rel="copy-dir" href="public" />

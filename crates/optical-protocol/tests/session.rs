@@ -7,8 +7,9 @@
 
 use std::time::Duration;
 
+use optical_protocol::crypto::SAS_DIGITS;
 use optical_protocol::session::{
-    Event, PeerId, Role, Session, State, HELLO_INTERVAL, PEER_TIMEOUT,
+    Event, PeerId, Role, Session, State, HELLO_INTERVAL, HELLO_LEN, PAIRING_ROTATION, PEER_TIMEOUT,
 };
 use optical_protocol::wire::{Flags, Pdu, PduKind};
 
@@ -45,7 +46,16 @@ fn announces_itself_while_searching() {
     let pdu = s.poll_transmit().expect("should announce itself");
     assert_eq!(pdu.kind, PduKind::Hello);
     assert!(pdu.flags.contains(Flags::SYN));
-    assert_eq!(pdu.payload, peer(1).as_bytes().to_vec());
+    assert_eq!(pdu.payload.len(), HELLO_LEN);
+    assert_eq!(
+        &pdu.payload[..16],
+        peer(1).as_bytes(),
+        "the identifier leads the announcement: role election reads it"
+    );
+    assert!(
+        pdu.payload[16..].iter().any(|b| *b != 0),
+        "an announcement with no key material in it would pair with anything"
+    );
 }
 
 #[test]
@@ -122,17 +132,23 @@ fn different_identifiers_give_different_sessions() {
 }
 
 #[test]
-fn discovering_a_peer_fires_exactly_one_event() {
+fn discovering_a_peer_happens_exactly_once() {
     let mut a = Session::new(peer(1));
     let hello = Session::new(peer(9)).poll_transmit().unwrap();
 
+    // One announcement both reveals the peer and completes the key agreement,
+    // because it carries the identifier and the public key together. There is
+    // no second round trip to wait for.
     let events = a.handle_incoming(&hello);
     assert_eq!(
         events,
-        vec![Event::PeerDiscovered {
-            peer: peer(9),
-            role: Role::Leader
-        }]
+        vec![
+            Event::PeerDiscovered {
+                peer: peer(9),
+                role: Role::Leader
+            },
+            Event::Paired
+        ]
     );
 
     assert!(
@@ -324,5 +340,155 @@ fn a_closed_session_reacts_to_nothing() {
     assert!(
         a.close().is_empty(),
         "closing twice does not repeat the event"
+    );
+}
+
+#[test]
+fn both_sides_derive_the_same_authentication_string() {
+    let mut a = Session::new(peer(1));
+    let mut b = Session::new(peer(9));
+
+    let hello_a = a.poll_transmit().expect("a announces");
+    let hello_b = b.poll_transmit().expect("b announces");
+
+    a.handle_incoming(&hello_b);
+    b.handle_incoming(&hello_a);
+
+    let sas_a = a.short_auth_string().expect("a paired").to_owned();
+    let sas_b = b.short_auth_string().expect("b paired").to_owned();
+
+    // The whole defence against a man in the middle is two people comparing
+    // these digits aloud. If the two ends can disagree while both believing
+    // they are paired, the comparison proves nothing.
+    assert_eq!(sas_a, sas_b);
+    assert_eq!(sas_a.len(), SAS_DIGITS);
+}
+
+#[test]
+fn the_pairing_code_changes_when_nobody_answers() {
+    let mut s = Session::new(peer(1));
+    let first = s.poll_transmit().expect("announces").payload;
+
+    s.handle_timeout(PAIRING_ROTATION);
+    let after = s.poll_transmit().expect("announces again").payload;
+
+    assert_eq!(
+        first[..16],
+        after[..16],
+        "the identifier must survive rotation: role election compares identifiers, \
+         and a peer whose identifier moves is a different peer to whoever is watching"
+    );
+    assert_ne!(
+        first[16..],
+        after[16..],
+        "a code left facing a window all afternoon should not still open the link"
+    );
+}
+
+#[test]
+fn the_pairing_code_stops_rotating_once_a_peer_is_found() {
+    let mut a = Session::new(peer(1));
+    let hello_b = Session::new(peer(9)).poll_transmit().unwrap();
+    a.handle_incoming(&hello_b);
+
+    assert!(a.rotation_due().is_none(), "a found peer ends the search");
+
+    let before = a.poll_transmit().expect("still announces").payload;
+
+    // Well past a rotation window, with the peer kept alive throughout.
+    let mut t = Duration::ZERO;
+    while t < PAIRING_ROTATION * 2 {
+        t += PEER_TIMEOUT / 2;
+        a.handle_timeout(t);
+        a.handle_incoming(&hello_b);
+    }
+
+    let after = a.poll_transmit().expect("still announces").payload;
+    assert_eq!(
+        before, after,
+        "rotating after pairing would throw away an agreement that already worked"
+    );
+}
+
+#[test]
+fn a_rotation_on_the_peers_side_is_recovered_from() {
+    let mut a = Session::new(peer(1));
+    let mut b = Session::new(peer(9));
+
+    // b announces and a pairs against that key.
+    let old_b = b.poll_transmit().expect("b announces");
+    a.handle_incoming(&old_b);
+    let first = a.short_auth_string().expect("a paired").to_owned();
+
+    // Nobody answered b in time, so b draws a fresh key. This is the window
+    // that matters: a is holding keys derived from material b has discarded.
+    b.handle_timeout(PAIRING_ROTATION);
+    let new_b = b.poll_transmit().expect("b announces again");
+    assert_ne!(old_b.payload, new_b.payload);
+
+    // Seeing the new material, a agrees again rather than keeping keys that
+    // cannot work. Without this the two ends stay silently out of step, and a
+    // key mismatch on an optical link looks exactly like a dirty lens.
+    a.handle_incoming(&new_b);
+    let second = a.short_auth_string().expect("a still paired").to_owned();
+    assert_ne!(first, second);
+
+    // And b, once it sees a, lands on the same digits.
+    let hello_a = a.poll_transmit().expect("a announces");
+    b.handle_incoming(&hello_a);
+    assert_eq!(b.short_auth_string(), Some(second.as_str()));
+}
+
+#[test]
+fn seeing_and_being_seen_are_answered_separately() {
+    let mut a = Session::new(peer(1));
+    let mut b = Session::new(peer(9));
+
+    // b's first announcement went out before it had seen anyone, so it carries
+    // no session identifier.
+    let first_b = b.poll_transmit().expect("b announces");
+    assert_eq!(first_b.session_id, 0);
+
+    a.handle_incoming(&first_b);
+    assert!(a.sees_peer(), "a has read b's code");
+    assert!(
+        !a.peer_sees_us(),
+        "b announced before it had seen anything, so nothing yet says it can \
+         see a — and claiming otherwise would send someone to adjust the end \
+         that is already working"
+    );
+
+    // Now b reads a, and its next announcement carries the identifier derived
+    // from both of them.
+    let hello_a = a.poll_transmit().expect("a announces");
+    b.handle_incoming(&hello_a);
+    let second_b = {
+        b.handle_timeout(HELLO_INTERVAL);
+        b.poll_transmit().expect("b announces again")
+    };
+    assert_ne!(second_b.session_id, 0);
+
+    a.handle_incoming(&second_b);
+    assert!(
+        a.peer_sees_us(),
+        "an identifier derived from both peers can only come from one that has \
+         read this one's"
+    );
+}
+
+#[test]
+fn losing_the_peer_withdraws_the_claim_that_it_can_see_us() {
+    let mut a = Session::new(peer(1));
+    let mut b = Session::new(peer(9));
+
+    b.handle_incoming(&a.poll_transmit().expect("a announces"));
+    b.handle_timeout(HELLO_INTERVAL);
+    a.handle_incoming(&b.poll_transmit().expect("b announces"));
+    assert!(a.peer_sees_us());
+
+    a.handle_timeout(HELLO_INTERVAL + PEER_TIMEOUT);
+    assert!(
+        !a.peer_sees_us(),
+        "a peer that has gone quiet is not a peer that can still see us"
     );
 }

@@ -6,50 +6,30 @@
 
 use std::sync::Mutex;
 
-use tauri::ipc::{InvokeBody, Request};
+use optical_codec::decode::FrameScan;
 use tauri::State;
 
 use crate::engine::{Engine, FrameOutcome, Status};
 
 pub struct AppState(pub Mutex<Engine>);
 
-/// Header at the front of a camera frame: width and height as little-endian
-/// u32.
+/// Hands one scan result to the engine.
 ///
-/// Carried inside the payload rather than as separate arguments because the
-/// frame has to arrive as a raw binary body, and that only happens when the
-/// typed array is the *entire* invoke argument. Adding a second argument would
-/// wrap it in an object and send every pixel through JSON as a number — about
-/// four megabytes of text per frame instead of nine hundred kilobytes of bytes.
-const HEADER_LEN: usize = 8;
-
-/// Hands one greyscale camera frame to the engine.
+/// The decode happens in the interface, not here. Nine hundred kilobytes of
+/// pixels per frame used to cross this boundary as a raw binary body, which
+/// worked on desktop and could never work on Android: its WebView does not
+/// expose request bodies, so Tauri falls back to a text channel and the frame
+/// arrives as anything but bytes. Sending the result of the decode instead —
+/// well under a hundred bytes — removes the difference between the two
+/// platforms rather than papering over it.
 #[tauri::command]
-pub fn on_frame(state: State<'_, AppState>, request: Request<'_>) -> Result<FrameOutcome, String> {
-    let InvokeBody::Raw(buf) = request.body() else {
-        return Err("expected a raw binary body; was the typed array nested in an object?".into());
-    };
-    if buf.len() < HEADER_LEN {
-        return Err(format!(
-            "frame of {} B is shorter than its header",
-            buf.len()
-        ));
-    }
-
-    let width = u32::from_le_bytes(buf[0..4].try_into().expect("4 B")) as usize;
-    let height = u32::from_le_bytes(buf[4..8].try_into().expect("4 B")) as usize;
-    let pixels = &buf[HEADER_LEN..];
-
-    let expected = width.checked_mul(height).ok_or("dimensions overflow")?;
-    if pixels.len() != expected {
-        return Err(format!(
-            "expected {expected} px for {width}x{height}, got {}",
-            pixels.len()
-        ));
-    }
-
+pub fn on_scan(
+    state: State<'_, AppState>,
+    scan: FrameScan,
+    decode_ms: f32,
+) -> Result<FrameOutcome, String> {
     let mut engine = state.0.lock().map_err(|_| "engine lock poisoned")?;
-    Ok(engine.on_camera_frame(width, height, pixels))
+    Ok(engine.on_scan(&scan, decode_ms))
 }
 
 /// The code to show right now, as an SVG document.
@@ -125,4 +105,66 @@ pub fn reset(state: State<'_, AppState>) -> Result<(), String> {
     let mut engine = state.0.lock().map_err(|_| "engine lock poisoned")?;
     *engine = Engine::new();
     Ok(())
+}
+
+/// Flips fullscreen.
+///
+/// Bound to F11 in the interface. The window starts fullscreen every time, and
+/// a fullscreen window with no chrome and no way out is a trap rather than a
+/// feature — this and `leave_fullscreen` are that way out.
+///
+/// On mobile there is nothing to flip: the one window IS the screen, and
+/// `tauri::Window` has no `set_fullscreen` there at all. The command still
+/// exists so the handler list stays the same on every platform.
+#[tauri::command]
+pub fn toggle_fullscreen(window: tauri::Window) -> Result<bool, String> {
+    #[cfg(desktop)]
+    {
+        let now = window.is_fullscreen().map_err(|e| e.to_string())?;
+        window.set_fullscreen(!now).map_err(|e| e.to_string())?;
+        Ok(!now)
+    }
+    #[cfg(not(desktop))]
+    {
+        let _ = window;
+        Ok(true)
+    }
+}
+
+/// Leaves fullscreen, and does nothing if the window is already windowed.
+///
+/// Bound to Escape. Separate from the toggle because an Escape that *entered*
+/// fullscreen would surprise anyone who pressed it to get out of something else.
+#[tauri::command]
+pub fn leave_fullscreen(window: tauri::Window) -> Result<(), String> {
+    #[cfg(desktop)]
+    {
+        if window.is_fullscreen().map_err(|e| e.to_string())? {
+            window.set_fullscreen(false).map_err(|e| e.to_string())?;
+        }
+    }
+    #[cfg(not(desktop))]
+    {
+        let _ = window;
+    }
+    Ok(())
+}
+
+/// Whether this platform hands out control of the display's brightness.
+///
+/// The interface asks once and hides the control where the answer is no, rather
+/// than offering a slider that silently does nothing.
+#[tauri::command]
+#[must_use]
+pub fn brightness_controllable() -> bool {
+    crate::brightness::controllable()
+}
+
+/// Sets the display brightness, 0..1.
+///
+/// On this application that is transmit power, not a comfort setting: it is the
+/// only control in the interface that changes the physics of the link.
+#[tauri::command]
+pub fn set_brightness(app: tauri::AppHandle, level: f32) -> Result<(), String> {
+    crate::brightness::set(&app, level)
 }
