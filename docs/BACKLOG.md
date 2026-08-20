@@ -1,5 +1,7 @@
 # Backlog
 
+<!-- rev:001 (RFC 3339) 2026-08-20T16:00:38Z -->
+
 Work that is known, wanted and not done. Each entry says what it is and why it
 is worth doing, so that picking one up does not start with reconstructing the
 reasoning.

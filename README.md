@@ -1,5 +1,7 @@
 # Lightgap
 
+<!-- rev:001 (RFC 3339) 2026-08-20T16:00:38Z -->
+
 An air-gapped multimodal modem. Two devices exchange files using only the
 hardware they already have — a display and a camera, and optionally a speaker
 and microphone. No network, no Bluetooth, no cable.
@@ -141,24 +143,43 @@ exchange is security theatre.
 
 ## Documentation
 
+- [Architecture](docs/ARCHITECTURE.md) — components, a frame's journey, and the
+  handshake lifecycle
 - [Design](docs/superpowers/specs/2026-08-19-multimodal-modem-design.md) — the
   full design, with an appendix of what measurement contradicted about it
+- [Decisions](docs/adr/) — why the core performs no I/O, and why the decode
+  moved into the interface
 - [Mobile](docs/mobile.md) — Android and iOS, and the pairing table
-- [Phase 0 measurement](docs/phase-0-measurement.md) — the camera-path
-  throughput spike and how to run it
+- [Phase 0 measurement](docs/phase-0-measurement.md) — the camera-path question
+  that decided where the decode runs
+- [Backlog](docs/BACKLOG.md) · [Issues](docs/ISSUES.md) ·
+  [Bugs](docs/BUGS.md) — what is known and undone, with the evidence
+- [Contributing](docs/CONTRIBUTORS.md) — toolchain, commands, conventions
 
 ## Status
 
-The protocol core, optical codec, calibration, acoustic codec, multiplexer,
-pairing and the transfer engine are implemented and tested. Two modems move a
-real file end to end — over a channel losing 70% of frames, and separately
-through real QR codes photographed by the synthetic camera — with no hardware
-involved.
+Everything below the application is implemented and tested: the protocol core,
+the optical codec, calibration, the acoustic codec, the multiplexer, pairing and
+the transfer engine. Two modems move a real file end to end over a channel
+losing 70% of frames, and separately through real QR codes photographed by a
+synthetic camera, with no hardware involved.
 
-What remains is the Tauri adapter: turning camera frames into engine calls and
-engine output into a code on screen. That is gated on the Phase 0 measurement,
-which needs two physical devices.
+Both applications exist. Desktop and Android build from this tree and hold a
+link across a real gap: they find each other, lock, agree on a frame size from
+each other's cameras, derive a shared key and display the same six digits.
+Throughput on real hardware has been measured at roughly 1.2 kB/s in the good
+direction.
+
+What is not finished is the last mile of that link. One direction of one pair
+reads only about a tenth of the frames it is shown for reasons not yet
+understood, which is enough to hold a session and not enough to complete a large
+transfer — see [docs/BUGS.md](docs/BUGS.md). Payloads also still cross the gap
+unencrypted: key agreement works, but `seal` and `open` are not yet wired into
+the data path ([docs/ISSUES.md](docs/ISSUES.md)).
+
+The acoustic channel is implemented and has never made a sound; there is no
+audio driver behind it.
 
 ## License
 
-MIT
+MIT — see [LICENSE](LICENSE).

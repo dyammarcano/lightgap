@@ -75,12 +75,32 @@ Over the JSON path those same bytes travel as numbers in text — on the order o
 
 ## Result
 
-- **Verdict:** _(pending)_
-- **Dominant segment:** _(pending)_
-- **Decision:** _(pending — stay on the hybrid path, or take fallback (a)/(b)/(c))_
-- **Operating point chosen for Phase 2:** _(pending)_
+The table above was never filled in, and the reason is worth recording: the
+question it was designed to answer was settled before the harness could answer
+it, and settled the other way.
 
-Once recorded: delete `tauri-app/src/spike.rs`,
-`tauri-app/src-tauri/src/spike.rs`, `scripts/`, the `.spike` styles in
-`styles.css`, the dependencies marked as Phase 0 in both manifests, and put
-`main.rs` back to mounting `<App/>`.
+- **Verdict:** the hybrid path is **viable on desktop and impossible on
+  Android.** Android's WebView does not expose the body of an intercepted
+  request, so Tauri falls back to a text channel and a raw binary body cannot
+  cross the IPC bridge at all. The failure is not a slow frame — `Rust_ipc` is
+  `extern "C"` and cannot unwind, so the rejection became `panic_cannot_unwind`
+  and aborted the process on the first camera frame, before one had ever been
+  displayed.
+- **Dominant segment:** on the path actually shipped, **decode**. Transport
+  fell to roughly 3 ms once what crossed the bridge was the decode's output
+  (under a hundred bytes) rather than its input (921,608 B). Capture and decode
+  together cost 75–100 ms per scan.
+- **Decision:** **fallback (b) — move the decode to wasm.** Not chosen for
+  throughput, chosen because (a) and (c) could not have helped: region tracking
+  reduces pixels but they still could not cross, and `nokhwa` has no Android
+  camera behind it. Fallback (a) was then adopted **as well**, on top of (b):
+  the interface scans the whole frame while searching and only the code's
+  neighbourhood once locked, which is what makes a wasm decode fast enough.
+- **Operating point chosen for Phase 2:** capture at 1920x1080, scan a budget
+  of 950,000 px while searching and 420,000 px while tracking, at roughly 10–13
+  scans per second. Raising the search budget with the capture resolution was
+  tried and reverted — it took a scan from 130 ms to 285 ms and read no more
+  codes.
+
+The spike code (`tauri-app/src/spike.rs`, `tauri-app/src-tauri/src/spike.rs`,
+`scripts/`, the `.spike` styles and the Phase 0 dependencies) has been removed.

@@ -1,3 +1,9 @@
+//! The interface, compiled to wasm and mounted by Trunk.
+//!
+//! Everything of substance lives in [`app`]: camera capture, the QR decode,
+//! the code on screen, and the calibration loops that settle exposure,
+//! brightness and frame size. This file only mounts it.
+
 mod app;
 
 use app::*;
