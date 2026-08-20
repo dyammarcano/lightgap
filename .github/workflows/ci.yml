@@ -1,0 +1,100 @@
+name: CI
+
+# The suite is the reason this is worth running rather than a formality. A 5 MB
+# transfer at 40% loss and two engines discovering each other through a
+# synthetic camera both run without hardware, so this exercises the parts that
+# are otherwise only ever checked by hand with two devices on a table.
+on:
+  push:
+    branches: [master]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+  # Backtraces cost nothing here and turn "assertion failed" into something
+  # that can be acted on without a second run.
+  RUST_BACKTRACE: 1
+
+jobs:
+  check:
+    name: fmt, clippy, tests
+    runs-on: ubuntu-24.04
+
+    steps:
+      - uses: actions/checkout@v4
+
+      # Tauri links against the system webview even for a check build, so the
+      # backend crate does not compile without these.
+      - name: System libraries Tauri links against
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libwebkit2gtk-4.1-dev \
+            libgtk-3-dev \
+            librsvg2-dev \
+            libayatana-appindicator3-dev \
+            libsoup-3.0-dev \
+            libjavascriptcoregtk-4.1-dev \
+            patchelf
+
+      - name: Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+          # The interface crate compiles for nothing else. Leaving this out
+          # gives a green run with a broken frontend, which is worse than a
+          # red one.
+          targets: wasm32-unknown-unknown
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Formatting
+        run: cargo fmt --all -- --check
+
+      - name: Clippy, native
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+      - name: Clippy, wasm
+        run: cargo clippy -p lightgap-ui --target wasm32-unknown-unknown -- -D warnings
+
+      - name: Tests
+        run: cargo test --workspace
+
+  frontend:
+    name: frontend bundles
+    runs-on: ubuntu-24.04
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+
+      - uses: Swatinem/rust-cache@v2
+
+      - uses: jetli/trunk-action@v0.5.0
+        with:
+          version: latest
+
+      # Trunk downloads the standalone Tailwind binary itself, pinned in
+      # Trunk.toml, so there is no Node toolchain to install.
+      - name: Build
+        working-directory: tauri-app
+        run: trunk build --release
+
+      # The interface keeps its markup in Rust, so Tailwind scans .rs files
+      # through an `@source` glob. If that glob ever stops matching, every
+      # utility is pruned as unused and the build still succeeds — with an
+      # unstyled page. Checking that one class survived costs nothing and
+      # catches the whole failure.
+      - name: Styles survived the scan
+        working-directory: tauri-app
+        run: |
+          css=$(ls dist/*.css | head -1)
+          echo "bundle: $css ($(wc -c < "$css") bytes)"
+          grep -q -- '--color-gold' "$css" \
+            || { echo "the theme did not reach the bundle"; exit 1; }
+          grep -q 'aspect-square' "$css" \
+            || { echo "utilities were pruned: the .rs source glob no longer matches"; exit 1; }

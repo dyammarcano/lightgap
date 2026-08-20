@@ -4,43 +4,23 @@ Work that is known, wanted and not done. Each entry says what it is and why it
 is worth doing, so that picking one up does not start with reconstructing the
 reasoning.
 
-## Continuous integration and release artefacts
+## Release artefacts that are signed
 
-GitHub Actions is not set up at all. The repository is public and there is
-nothing checking that a push still builds.
+`.github/workflows/` now carries CI (fmt, clippy on both targets, the test
+suite, and a frontend build that checks the styles survived Tailwind's scan)
+and a release workflow producing desktop bundles for the three platforms plus
+an Android APK on a tag.
 
-**CI.** On push and pull request: `cargo fmt --check`, `cargo clippy --workspace
---all-targets -- -D warnings`, `cargo clippy -p lightgap-ui --target
-wasm32-unknown-unknown -- -D warnings`, and `cargo test --workspace`. The wasm
-target needs to be installed in the job and is easy to forget — the interface
-crate only compiles for it, so a native-only run would pass while the frontend
-was broken.
+What is deliberately not done there is signing. The desktop bundles are
+unsigned and the APK is a debug build — a few hundred megabytes, because
+nothing is stripped. Both need certificates or a keystore in the repository's
+secrets, which is a decision to make on purpose rather than a step to add while
+wiring up a build. A release APK also needs `keyAlias`/`storeFile` wiring in
+`gen/android/app/build.gradle.kts`, which is committed and carries deliberate
+edits, so it has to be modified rather than regenerated.
 
-The test suite is the reason this is worth having rather than a formality: the
-5 MB transfer at 40% loss and the two engines discovering each other through a
-synthetic camera both run without hardware, so CI exercises the parts that are
-otherwise only ever tested by hand with two devices on a table.
-
-**Desktop binaries.** `cargo tauri build` for Windows, macOS and Linux on a
-release tag. Unsigned to begin with; signing is a separate decision with
-certificates attached to it.
-
-**Android APK.** `cargo tauri android build --apk`. Two things this needs that
-the desktop jobs do not: the Android SDK and NDK in the runner, and a signing
-key. A debug APK is 373 MB because nothing is stripped — a release build is a
-fraction of that, and worth doing properly rather than publishing the debug one.
-
-**iOS** stays out. It needs macOS and Xcode and the project has never been
-generated; see `docs/mobile.md`.
-
-Notes for whoever writes this:
-
-- Cache `~/.cargo` and `target/` or the wasm and Android builds will dominate
-  the run time.
-- `trunk` and `tauri-cli` both need installing in the job.
-- The Android project under `gen/android` is committed and carries deliberate
-  edits — camera permissions, `keepScreenOn`, the brightness plugin. CI must
-  build it, never regenerate it.
+**iOS** stays out entirely. It needs macOS and Xcode and the project has never
+been generated; see `docs/mobile.md`.
 
 ## Encryption on the data path
 
