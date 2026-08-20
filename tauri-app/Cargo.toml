@@ -36,6 +36,8 @@ features = [
     "MediaStreamConstraints",
     "MediaStreamTrack",
     "Navigator",
+    "Document",
+    "Element",
     "Storage",
     "console",
     "Performance",

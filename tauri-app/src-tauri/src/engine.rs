@@ -14,9 +14,6 @@ use optical_codec::decode::FrameScan;
 // in front of the IPC boundary instead.
 #[cfg(test)]
 use optical_codec::decode::scan_greyscale;
-// Only the test-only reference size consults a device profile now; the link
-// itself starts at the floor and learns the rest from the peer.
-#[cfg(test)]
 use optical_codec::device::{suggest_profile, FormFactor, VisualCapabilities};
 use optical_codec::encode::{encode, max_payload, Ecc};
 use optical_codec::geometry::{advise, Advice, QrGeometry};
@@ -219,6 +216,11 @@ pub struct Engine {
     /// Frame-size control, driven by what the *peer* says it is reading.
     mtu: Aimd,
     with_code_at_mark: u64,
+    /// This device's own capture and display sizes, as the interface measured
+    /// them. Zero until it has said.
+    local: VisualCapabilities,
+    /// Whether the peer's capabilities have already seeded the frame size.
+    seeded: bool,
     last_geometry: Option<QrGeometry>,
     last_advice: Advice,
     received: Option<(String, Vec<u8>)>,
@@ -276,6 +278,12 @@ impl Engine {
                 MTU_STEP,
             ),
             with_code_at_mark: 0,
+            local: VisualCapabilities {
+                display_px: (0, 0),
+                camera_px: (0, 0),
+                form_factor: FormFactor::Laptop,
+            },
+            seeded: false,
             last_geometry: None,
             last_advice: Advice::MoveCloser,
             received: None,
@@ -482,6 +490,65 @@ impl Engine {
         self.on_scan(&scan, decode_ms)
     }
 
+    /// Records what this device actually is, as measured rather than assumed.
+    ///
+    /// The capture resolution is announced to the peer, because only this end
+    /// can know it and only the peer can use it. The display size stays here,
+    /// because it is half of the same sum: a code has to be drawable on this
+    /// screen and resolvable by that camera, and neither device holds both
+    /// numbers on its own.
+    pub fn set_local_capabilities(&mut self, camera: (u32, u32), display: (u32, u32)) {
+        self.local.camera_px = camera;
+        self.local.display_px = display;
+        self.modem.set_camera_px(camera.0, camera.1);
+    }
+
+    /// Sets the frame size from what the two devices actually are.
+    ///
+    /// Once, on the first announcement that carries the peer's camera. After
+    /// that the controller has measurements, which beat any profile — but the
+    /// climb from the floor costs twenty seconds of crawling on every link, and
+    /// the profile puts it near the answer immediately. It is a starting point
+    /// computed from two real numbers, which is a different thing from the
+    /// assumed-laptop guess this used to open with.
+    fn seed_frame_size(&mut self) {
+        if self.seeded || self.local.camera_px.0 == 0 {
+            return;
+        }
+        let Some((w, h)) = self.modem.peer_camera_px() else {
+            return;
+        };
+
+        let peer = VisualCapabilities {
+            display_px: (0, 0),
+            camera_px: (w, h),
+            form_factor: FormFactor::Laptop,
+        };
+        let Some(profile) = suggest_profile(&self.local, &peer, DISPLAY_ECC) else {
+            // The pair genuinely cannot manage a readable code between them.
+            // The floor is already where the link is; leave it there.
+            self.seeded = true;
+            return;
+        };
+
+        let target = (profile.payload_bytes as u32)
+            .clamp(MINIMUM_MTU as u32, max_payload(DISPLAY_ECC) as u32);
+        self.seeded = true;
+        if self.modem.set_mtu(target as usize) {
+            self.mtu = Aimd::new(
+                target,
+                MINIMUM_MTU as u32,
+                max_payload(DISPLAY_ECC) as u32,
+                MTU_STEP,
+            );
+            self.note(format!(
+                "frame set to {target} B from the pair's own sizes \
+                 (their camera {w}x{h}, this display {}x{})",
+                self.local.display_px.0, self.local.display_px.1
+            ));
+        }
+    }
+
     /// Recomputes throughput if the window has elapsed.
     ///
     /// Counted in payload bytes rather than frames, because frames are not what
@@ -513,6 +580,7 @@ impl Engine {
             self.modem.set_read_quality(quality);
         }
 
+        self.seed_frame_size();
         self.adapt_frame_size();
 
         self.rate_since = Instant::now();
@@ -641,6 +709,7 @@ impl Engine {
                     MTU_STEP,
                 );
                 self.modem.set_mtu(MINIMUM_MTU);
+                self.seeded = false;
                 self.note("peer lost, frame back to the floor");
             }
             Event::Closed => self.note("session closed"),

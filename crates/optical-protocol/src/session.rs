@@ -122,7 +122,7 @@ pub const BEACON_LEN: usize = 16;
 /// each end reports what it observes, and the *other* end is the one that acts
 /// on it. Without it, sizing would have to assume the two directions are alike,
 /// which is the one thing this design has said from the start that they are not.
-pub const HELLO_LEN: usize = 16 + ANNOUNCEMENT_LEN + 2;
+pub const HELLO_LEN: usize = 16 + ANNOUNCEMENT_LEN + 2 + 4;
 
 /// How long one pairing code stays valid before a fresh ephemeral key is drawn.
 ///
@@ -132,6 +132,14 @@ pub const HELLO_LEN: usize = 16 + ANNOUNCEMENT_LEN + 2;
 /// is seen: past that point a changing key would only be a way to lose an
 /// agreement that already succeeded.
 pub const PAIRING_ROTATION: Duration = Duration::from_secs(30);
+
+/// How long this end holds still once it has acquired the peer.
+///
+/// Long enough for a camera that is struggling: several seconds of an
+/// unchanging, minimal code, which is the easiest thing this protocol can
+/// possibly display. Short enough that it costs nothing worth counting — the
+/// link spends minutes transferring and this happens once.
+pub const LOCK_HOLD: Duration = Duration::from_secs(5);
 
 /// The session.
 #[derive(Debug)]
@@ -151,6 +159,10 @@ pub struct Session {
     /// the useful one: an optical link fails one direction at a time, and
     /// knowing which end is aimed wrong is most of knowing what to do about it.
     peer_sees_us: bool,
+    /// While set, this end is holding a still frame to be acquired back.
+    holding_until: Option<Duration>,
+    /// Whether the peer has said it has acquired this end.
+    peer_locked: bool,
     /// How well this end is reading the peer, as it will be reported to them.
     read_quality: u8,
     /// How well the peer says it is reading this end, if it has said.
@@ -167,6 +179,15 @@ pub struct Session {
     /// guesses will make things worse.
     sees_anything: bool,
     peer_sees_anything: Option<bool>,
+    /// This end's capture resolution, and the peer's.
+    ///
+    /// Announced because the peer needs it and cannot measure it: how large a
+    /// code this end should draw depends on how many pixels the *other* camera
+    /// will land on it, and only that camera knows. Sizing without it means
+    /// climbing from the floor one step at a time and paying for the climb on
+    /// every link, when the answer was available to be asked for.
+    camera_px: (u16, u16),
+    peer_camera_px: Option<(u16, u16)>,
     pairing: Pairing,
     pending: Option<Pdu>,
 }
@@ -185,10 +206,14 @@ impl Session {
             next_hello: Duration::ZERO,
             next_rotation: PAIRING_ROTATION,
             peer_sees_us: false,
+            holding_until: None,
+            peer_locked: false,
             read_quality: 0,
             peer_read_quality: None,
             sees_anything: false,
             peer_sees_anything: None,
+            camera_px: (0, 0),
+            peer_camera_px: None,
             pairing: Pairing::new(),
             pending: None,
         }
@@ -263,6 +288,41 @@ impl Session {
         }
     }
 
+    /// Records this end's capture resolution, to be announced to the peer.
+    pub fn set_camera_px(&mut self, width: u32, height: u32) {
+        self.camera_px = (
+            u16::try_from(width).unwrap_or(u16::MAX),
+            u16::try_from(height).unwrap_or(u16::MAX),
+        );
+    }
+
+    /// The peer's capture resolution, once it has said.
+    ///
+    /// What this end should size its code against — combined with this end's
+    /// own display, since a code has to be both drawable here and resolvable
+    /// there.
+    #[must_use]
+    pub fn peer_camera_px(&self) -> Option<(u32, u32)> {
+        self.peer_camera_px
+            .map(|(w, h)| (u32::from(w), u32::from(h)))
+    }
+
+    /// Whether this end is currently holding a still frame to be found.
+    #[must_use]
+    pub fn holding_still(&self) -> bool {
+        self.holding_until.is_some_and(|until| self.now < until)
+    }
+
+    /// Whether the peer has said it has acquired this end.
+    ///
+    /// Distinct from `peer_sees_us`, which is inferred from an identifier it
+    /// could only have computed by reading ours. This is the peer saying so
+    /// outright, in the frame it holds still while it says it.
+    #[must_use]
+    pub const fn peer_locked(&self) -> bool {
+        self.peer_locked
+    }
+
     /// Whether we can see the peer.
     #[must_use]
     pub const fn sees_peer(&self) -> bool {
@@ -319,7 +379,17 @@ impl Session {
     /// carries zero, because at that moment they had not. Nothing extra goes on
     /// the wire to learn this: the proof was already in a field that had to be
     /// there anyway.
-    fn observe_peer(&mut self, remote: PeerId, session_id: u64, events: &mut Vec<Event>) {
+    fn observe_peer(
+        &mut self,
+        remote: PeerId,
+        session_id: u64,
+        flags: Flags,
+        events: &mut Vec<Event>,
+    ) {
+        if flags.contains(Flags::LOCKED) {
+            self.peer_locked = true;
+        }
+
         self.peer_sees_us = session_id == Self::derive_session_id(&self.local, &remote);
 
         if self.remote != Some(remote) {
@@ -332,6 +402,10 @@ impl Session {
             };
             self.role = Some(role);
             self.state = State::Peered;
+            // Freeze what is on screen. This end can see the peer; the peer may
+            // still be hunting, and the kindest thing to show it is something
+            // that stops moving.
+            self.holding_until = Some(self.now + LOCK_HOLD);
             events.push(Event::PeerDiscovered { peer: remote, role });
         }
     }
@@ -360,6 +434,8 @@ impl Session {
                 payload.extend_from_slice(&self.pairing.announcement());
                 payload.push(self.read_quality);
                 payload.push(u8::from(self.sees_anything));
+                payload.extend_from_slice(&self.camera_px.0.to_le_bytes());
+                payload.extend_from_slice(&self.camera_px.1.to_le_bytes());
                 payload
             },
         }
@@ -383,7 +459,7 @@ impl Session {
                 if remote == self.local {
                     return events;
                 }
-                self.observe_peer(remote, pdu.session_id, &mut events);
+                self.observe_peer(remote, pdu.session_id, pdu.flags, &mut events);
                 // No key material here, so no agreement. It arrives with the
                 // `Hello` this discovery causes the peer to start sending.
             }
@@ -406,6 +482,7 @@ impl Session {
                 const NONCE: usize = PUBLIC + 32;
                 const QUALITY: usize = NONCE + 16;
                 const SEES: usize = QUALITY + 1;
+                const CAMERA: usize = SEES + 1;
 
                 let id: [u8; 16] = pdu.payload[..PUBLIC].try_into().expect("length checked");
                 let peer_public: [u8; 32] = pdu.payload[PUBLIC..NONCE]
@@ -416,6 +493,9 @@ impl Session {
                     .expect("length checked");
                 self.peer_read_quality = Some(pdu.payload[QUALITY]);
                 self.peer_sees_anything = Some(pdu.payload[SEES] != 0);
+                let cam_w = u16::from_le_bytes([pdu.payload[CAMERA], pdu.payload[CAMERA + 1]]);
+                let cam_h = u16::from_le_bytes([pdu.payload[CAMERA + 2], pdu.payload[CAMERA + 3]]);
+                self.peer_camera_px = (cam_w > 0 && cam_h > 0).then_some((cam_w, cam_h));
                 let remote = PeerId::from_bytes(id);
                 if remote == self.local {
                     // Seeing yourself — a mirror, or your own screen in frame —
@@ -423,7 +503,7 @@ impl Session {
                     return events;
                 }
 
-                self.observe_peer(remote, pdu.session_id, &mut events);
+                self.observe_peer(remote, pdu.session_id, pdu.flags, &mut events);
 
                 // Agree, or agree again if the peer is announcing material we
                 // have not used yet. Re-running is cheap and it is what makes a
@@ -491,6 +571,15 @@ impl Session {
         // not have seen ours yet: discovery is not symmetric in time.
         if matches!(self.state, State::Discovering | State::Peered) && self.now >= self.next_hello {
             self.next_hello = self.now + HELLO_INTERVAL;
+            // Holding still, having just found the peer. The same bytes every
+            // time, so the code on screen does not move while the other end
+            // tries to settle on it.
+            if self.holding_until.is_some_and(|until| self.now < until) {
+                let mut pdu = self.beacon();
+                pdu.flags = Flags::SYN | Flags::LOCKED;
+                return Some(pdu);
+            }
+
             return Some(if self.peer_sees_us {
                 self.hello()
             } else {
@@ -526,6 +615,9 @@ impl Session {
                 self.last_rx = None;
                 self.peer_sees_us = false;
                 self.peer_read_quality = None;
+                self.peer_locked = false;
+                self.holding_until = None;
+                self.peer_camera_px = None;
                 self.peer_sees_anything = None;
                 // Keys agreed with a peer that is gone are not keys worth
                 // keeping, and the next code shown should be a fresh one.

@@ -1186,6 +1186,22 @@ pub fn App() -> impl IntoView {
                 r_transport.push(now_ms() - t_transport);
 
                 tick += 1;
+                // What this device is, measured rather than assumed, and sent
+                // whenever it could have changed. The capture size settles once
+                // the camera opens and moves again if a different one is
+                // chosen; the code's pixel size moves whenever the window does.
+                if tick.is_multiple_of(40) {
+                    let pane = window()
+                        .document()
+                        .and_then(|d| d.query_selector(".qr-pane").ok().flatten())
+                        .map_or(0, |el| el.client_width().max(0) as u32);
+                    let args = Object::new();
+                    let _ = Reflect::set(&args, &"cameraW".into(), &JsValue::from(vw as u32));
+                    let _ = Reflect::set(&args, &"cameraH".into(), &JsValue::from(vh as u32));
+                    let _ = Reflect::set(&args, &"displayW".into(), &JsValue::from(pane));
+                    let _ = Reflect::set(&args, &"displayH".into(), &JsValue::from(pane));
+                    let _ = invoke("set_capabilities", args.into()).await;
+                }
                 if tick.is_multiple_of(5) {
                     set_capture_ms.set(r_capture.mean());
                     set_transport_ms.set(r_transport.mean());
@@ -1492,7 +1508,7 @@ pub fn App() -> impl IntoView {
                                 // shrinks, its modules land on fewer of the
                                 // peer's sensor pixels, and the read rate falls
                                 // for no reason at all.
-                                class="absolute inset-0 rounded-xl bg-white \
+                                class="qr-pane absolute inset-0 rounded-xl bg-white \
                                        [&>svg]:block [&>svg]:h-full [&>svg]:w-full"
                                 inner_html=move || qr.get()
                             ></div>

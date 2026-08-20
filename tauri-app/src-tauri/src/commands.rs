@@ -168,3 +168,22 @@ pub fn brightness_controllable() -> bool {
 pub fn set_brightness(app: tauri::AppHandle, level: f32) -> Result<(), String> {
     crate::brightness::set(&app, level)
 }
+
+/// Tells the engine what this device actually is.
+///
+/// Measured by the interface, which is the only part that knows: the capture
+/// resolution the camera settled on, and how many pixels the code is being
+/// drawn into. Both change — a different camera, a resized window — so this is
+/// sent whenever either does rather than once at startup.
+#[tauri::command]
+pub fn set_capabilities(
+    state: State<'_, AppState>,
+    camera_w: u32,
+    camera_h: u32,
+    display_w: u32,
+    display_h: u32,
+) -> Result<(), String> {
+    let mut engine = state.0.lock().map_err(|_| "engine lock poisoned")?;
+    engine.set_local_capabilities((camera_w, camera_h), (display_w, display_h));
+    Ok(())
+}

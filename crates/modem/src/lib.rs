@@ -187,6 +187,29 @@ impl Modem {
         self.session.set_read_quality(fraction);
     }
 
+    /// Records this end's capture resolution, to be announced to the peer.
+    pub fn set_camera_px(&mut self, width: u32, height: u32) {
+        self.session.set_camera_px(width, height);
+    }
+
+    /// The peer's capture resolution, once it has said.
+    #[must_use]
+    pub fn peer_camera_px(&self) -> Option<(u32, u32)> {
+        self.session.peer_camera_px()
+    }
+
+    /// Whether this end is holding a still frame to be acquired.
+    #[must_use]
+    pub fn holding_still(&self) -> bool {
+        self.session.holding_still()
+    }
+
+    /// Whether the peer has said it has acquired this end.
+    #[must_use]
+    pub fn peer_locked(&self) -> bool {
+        self.session.peer_locked()
+    }
+
     /// Records whether this end is finding any code at all to try to read.
     pub fn set_sees_anything(&mut self, seen: bool) {
         self.session.set_sees_anything(seen);

@@ -117,6 +117,16 @@ impl Flags {
     pub const FOUNTAIN: Self = Self(1 << 4);
     /// A copy of a critical PDU also sent over the other channel.
     pub const DUPLICATED: Self = Self(1 << 5);
+    /// This end has acquired the peer and is holding still to be acquired back.
+    ///
+    /// One bit, and it buys the other end a stationary target. Everything else
+    /// this protocol displays changes several times a second, which is right
+    /// for carrying data and wrong for being found: a camera that needs a few
+    /// frames to settle on a code spends them chasing a different code each
+    /// time. A frame that says "I can see you, and I am not going to change for
+    /// a few seconds" is the one thing that makes the second acquisition easier
+    /// than the first.
+    pub const LOCKED: Self = Self(1 << 6);
 
     #[must_use]
     pub const fn contains(self, other: Self) -> bool {

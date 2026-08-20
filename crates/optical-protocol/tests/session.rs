@@ -9,8 +9,8 @@ use std::time::Duration;
 
 use optical_protocol::crypto::SAS_DIGITS;
 use optical_protocol::session::{
-    Event, PeerId, Role, Session, State, BEACON_LEN, HELLO_INTERVAL, HELLO_LEN, PAIRING_ROTATION,
-    PEER_TIMEOUT,
+    Event, PeerId, Role, Session, State, BEACON_LEN, HELLO_INTERVAL, HELLO_LEN, LOCK_HOLD,
+    PAIRING_ROTATION, PEER_TIMEOUT,
 };
 
 use optical_protocol::wire::{Flags, Pdu, PduKind};
@@ -32,7 +32,10 @@ fn link(a: &mut Session, b: &mut Session) -> Duration {
 /// that never completes rather than as the harness winding time backwards.
 fn link_from(a: &mut Session, b: &mut Session, from: Duration) -> Duration {
     let mut clock = from;
-    for _ in 0..8 {
+    // Steps large enough to walk out of the lock hold — each end freezes for
+    // several seconds after it first sees the other — and small enough not to
+    // trip the peer timeout on the way.
+    for _ in 0..16 {
         if let Some(pdu) = a.poll_transmit() {
             b.handle_incoming(&pdu);
         }
@@ -42,7 +45,7 @@ fn link_from(a: &mut Session, b: &mut Session, from: Duration) -> Duration {
         if a.is_paired() && b.is_paired() {
             return clock;
         }
-        clock += HELLO_INTERVAL;
+        clock += LOCK_HOLD / 3;
         a.handle_timeout(clock);
         b.handle_timeout(clock);
     }
@@ -256,14 +259,20 @@ fn keeps_announcing_after_finding_a_peer() {
     pair(&mut a, &mut b, Duration::ZERO);
     assert_eq!(a.state(), State::Peered);
 
+    // Immediately after finding the peer it holds still, and says so. A frame
+    // that stops changing is the one thing that makes the second acquisition
+    // easier than the first, and the peer should be told that is what it is
+    // looking at.
     a.handle_timeout(HELLO_INTERVAL);
+    let held = a.poll_transmit().expect("must keep announcing");
+    assert_eq!(held.kind, PduKind::Beacon);
+    assert!(held.flags.contains(Flags::LOCKED));
+
+    // And once the hold expires it goes on announcing, because the other side
+    // may still not have seen us: discovery is not symmetric in time.
+    a.handle_timeout(LOCK_HOLD + HELLO_INTERVAL);
     let pdu = a.poll_transmit().expect("must keep announcing");
-    assert_eq!(
-        pdu.kind,
-        PduKind::Hello,
-        "the other side may not have seen us yet; discovery is not symmetric in \
-         time"
-    );
+    assert!(!pdu.flags.contains(Flags::LOCKED));
 }
 
 #[test]
