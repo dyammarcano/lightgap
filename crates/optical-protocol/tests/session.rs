@@ -22,11 +22,16 @@ use optical_protocol::wire::{Flags, Pdu, PduKind};
 /// frame the protocol can express; only once someone has answered does either
 /// spend modules on key material.
 fn link(a: &mut Session, b: &mut Session) -> Duration {
-    // Starts far ahead of anything a test is likely to have reached. The
-    // sessions own their own clocks and a harness that hands one a time earlier
-    // than it has already seen stops it announcing entirely — which reads as a
-    // handshake that never completes rather than as the harness being wrong.
-    let mut clock = PAIRING_ROTATION * 64;
+    link_from(a, b, PAIRING_ROTATION * 64)
+}
+
+/// The same, continuing from a clock a test has already advanced.
+///
+/// The sessions own their own clocks, and handing one a time earlier than it
+/// has already seen stops it announcing at all — which reads as a handshake
+/// that never completes rather than as the harness winding time backwards.
+fn link_from(a: &mut Session, b: &mut Session, from: Duration) -> Duration {
+    let mut clock = from;
     for _ in 0..8 {
         if let Some(pdu) = a.poll_transmit() {
             b.handle_incoming(&pdu);
@@ -89,11 +94,24 @@ fn announces_itself_while_searching() {
          read anything, so there is nothing to gain by sending more"
     );
 
-    // Once someone has answered, the link has shown it carries at least that
-    // much, and the full announcement is worth its extra modules.
+    // Reading the peer is not enough to escalate: what has to be demonstrated
+    // is that the peer can read *this* end.
     let mut s = s;
-    s.handle_incoming(&Session::new(peer(9)).poll_transmit().unwrap());
+    let mut other = Session::new(peer(9));
+    s.handle_incoming(&other.poll_transmit().unwrap());
     s.handle_timeout(HELLO_INTERVAL);
+    assert_eq!(
+        s.poll_transmit().expect("still announcing").kind,
+        PduKind::Beacon,
+        "seeing a peer says nothing about whether the peer can see us, and \
+         doubling the density here would aim the denser code at the camera that \
+         has not managed the sparse one"
+    );
+
+    // Once the peer has demonstrably read it, the fuller announcement is worth
+    // its extra modules.
+    let clock = link(&mut s, &mut other);
+    s.handle_timeout(clock + HELLO_INTERVAL);
     let pdu = s.poll_transmit().expect("should announce again");
     assert_eq!(pdu.kind, PduKind::Hello);
     assert_eq!(pdu.payload.len(), HELLO_LEN);
@@ -484,26 +502,20 @@ fn a_rotation_on_the_peers_side_is_recovered_from() {
     b.handle_timeout(clock);
     assert!(!b.is_paired(), "b should have let go of a");
 
-    // b finds a again and announces with its new key.
-    a.handle_timeout(clock);
-    b.handle_incoming(&a.poll_transmit().expect("a announces"));
-    clock += HELLO_INTERVAL;
-    b.handle_timeout(clock);
-    let new_b = b.poll_transmit().expect("b announces again");
+    // b re-establishes from scratch: a beacon each way again, then the
+    // announcements that carry keys. Its key material is new.
+    let _ = link_from(&mut a, &mut b, clock + HELLO_INTERVAL);
+    let second = a.short_auth_string().expect("a paired again").to_owned();
 
-    // Seeing the new material, a agrees again rather than keeping keys that
-    // cannot work. Without this the two ends stay silently out of step, and a
-    // key mismatch on an optical link looks exactly like a dirty lens.
-    a.handle_incoming(&new_b);
-    let second = a.short_auth_string().expect("a still paired").to_owned();
+    // Seeing new material, a agreed again rather than keeping keys that cannot
+    // work. Without that the two ends stay silently out of step, and a key
+    // mismatch on an optical link looks exactly like a dirty lens.
     assert_ne!(first, second);
-
-    // And b, once it sees a, lands on the same digits.
-    clock += HELLO_INTERVAL;
-    a.handle_timeout(clock);
-    let hello_a = a.poll_transmit().expect("a announces");
-    b.handle_incoming(&hello_a);
-    assert_eq!(b.short_auth_string(), Some(second.as_str()));
+    assert_eq!(
+        b.short_auth_string(),
+        Some(second.as_str()),
+        "and both ends must land on the same digits, or the comparison the          whole defence rests on proves nothing"
+    );
 }
 
 #[test]
@@ -621,10 +633,11 @@ fn the_reported_quality_is_forgotten_with_the_peer() {
 #[test]
 fn the_searching_frame_is_smaller_than_the_paired_one() {
     let mut a = Session::new(peer(1));
+    let mut b = Session::new(peer(9));
     let searching = a.poll_transmit().expect("a announces").to_vec().unwrap();
 
-    a.handle_incoming(&Session::new(peer(9)).poll_transmit().unwrap());
-    a.handle_timeout(HELLO_INTERVAL);
+    let clock = link(&mut a, &mut b);
+    a.handle_timeout(clock + HELLO_INTERVAL);
     let paired = a
         .poll_transmit()
         .expect("a announces again")

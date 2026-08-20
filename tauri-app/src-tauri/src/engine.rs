@@ -624,7 +624,25 @@ impl Engine {
                 self.current = None;
             }
             Event::SendComplete => self.note("the peer has the whole file"),
-            Event::PeerLost => self.note("peer lost"),
+            Event::PeerLost => {
+                // Give the frame size back with the peer it was negotiated for.
+                //
+                // It was climbed against one camera at one distance, and none of
+                // that is known to hold for whoever appears next — or even for
+                // the same peer after it has been moved. Keeping it is keeping a
+                // measurement of a link that no longer exists, and the failure
+                // it produces is the expensive kind: the first frames of the
+                // next link are unreadable, so nothing is measured, so the
+                // controller has nothing to bring it back down with.
+                self.mtu = Aimd::new(
+                    MINIMUM_MTU as u32,
+                    MINIMUM_MTU as u32,
+                    max_payload(DISPLAY_ECC) as u32,
+                    MTU_STEP,
+                );
+                self.modem.set_mtu(MINIMUM_MTU);
+                self.note("peer lost, frame back to the floor");
+            }
             Event::Closed => self.note("session closed"),
             Event::Progress { .. } => {}
         }

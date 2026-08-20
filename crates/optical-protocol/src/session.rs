@@ -468,18 +468,30 @@ impl Session {
         // Two shapes, and which one goes out is decided by whether anything is
         // known to be listening.
         //
-        // While searching, the smallest frame the protocol can express: a peer
-        // that cannot read a bare identifier cannot read anything, so there is
-        // nothing to gain by sending more and a great deal to lose. Once a peer
-        // has answered, the link has demonstrated it carries at least that
-        // much, and the full announcement — key material, and how well this end
-        // is reading — is worth its extra modules.
+        // The smallest frame the protocol can express, until the peer has
+        // demonstrated it can read this end. Not until this end can read the
+        // peer — that was the first version of this condition and it had the
+        // test backwards.
+        //
+        // The two are different in exactly the case that matters. A good camera
+        // looking at a poor one reads it immediately, moves to `Peered`, and on
+        // the old rule started announcing at twice the density — aimed at the
+        // camera that had not managed the sparse version yet and now had no
+        // chance at all. Seeing is not evidence about being seen; the link is
+        // measured separately in each direction, and this is that principle
+        // applied to the announcement itself.
+        //
+        // `peer_sees_us` is proof, not inference: it is set when a peer sends an
+        // identifier derived from both, which it can only have computed by
+        // reading ours. Once that has happened the link has demonstrably
+        // carried a beacon, and the full announcement — key material, and how
+        // well this end is reading — is worth its extra modules.
         //
         // It keeps repeating after a peer is found because the other side may
         // not have seen ours yet: discovery is not symmetric in time.
         if matches!(self.state, State::Discovering | State::Peered) && self.now >= self.next_hello {
             self.next_hello = self.now + HELLO_INTERVAL;
-            return Some(if self.remote.is_some() {
+            return Some(if self.peer_sees_us {
                 self.hello()
             } else {
                 self.beacon()
