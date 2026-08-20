@@ -13,11 +13,35 @@ use std::sync::Mutex;
 use commands::AppState;
 use engine::Engine;
 #[cfg(desktop)]
+use tauri::Manager;
+#[cfg(desktop)]
 use tauri_plugin_window_state::StateFlags;
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     let builder = tauri::Builder::default()
+        // Two destinations: one to watch live, one to read afterwards.
+        //
+        // Stdout is where a `cargo tauri dev` session is already being watched,
+        // and on Android it is what `adb logcat` picks up — so one command
+        // shows the whole story, where the previous alternative was
+        // photographing the screen. The log directory is what survives the run,
+        // which is the only way to examine a transfer that took twenty minutes
+        // and went wrong somewhere in the middle.
+        //
+        // The webview target is deliberately absent. It duplicates every line
+        // on Android, because the console it writes to is logcat as well.
+        .plugin(
+            tauri_plugin_log::Builder::new()
+                .level(log::LevelFilter::Info)
+                .target(tauri_plugin_log::Target::new(
+                    tauri_plugin_log::TargetKind::Stdout,
+                ))
+                .target(tauri_plugin_log::Target::new(
+                    tauri_plugin_log::TargetKind::LogDir { file_name: None },
+                ))
+                .build(),
+        )
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_dialog::init())
         .plugin(brightness::init());
@@ -46,6 +70,22 @@ pub fn run() {
     );
 
     builder
+        // Maximised every time, after the saved geometry has been restored.
+        //
+        // The plugin above remembers size and position, and left to itself it
+        // would also restore "not maximised" from whichever session someone
+        // last resized the window in. Size matters here for a physical reason —
+        // the display is the transmitter — so it is applied last and wins. The
+        // remembered geometry is still what the window returns to when it is
+        // restored down.
+        .setup(|app| {
+            #[cfg(desktop)]
+            if let Some(window) = app.get_webview_window("main") {
+                let _ = window.maximize();
+            }
+            let _ = app;
+            Ok(())
+        })
         .manage(AppState(Mutex::new(Engine::new())))
         .invoke_handler(tauri::generate_handler![
             commands::on_scan,

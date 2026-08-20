@@ -37,15 +37,49 @@ extern "C" {
 /// also crosses the process boundary and gets scanned, and the point of
 /// measuring in the running application is to find out where that trade lands on
 /// real hardware rather than to guess.
-const CAPTURE_W: u32 = 1280;
-const CAPTURE_H: u32 = 720;
+const CAPTURE_W: u32 = 1920;
+const CAPTURE_H: u32 = 1080;
 
-/// How often the camera frame is scanned, in milliseconds.
+/// Pixel budget for the wide search, when there is no code to track.
 ///
-/// Independent of the preview, which runs at whatever the camera provides. There
-/// is no point scanning faster than codes change on the other side, and scanning
-/// is the expensive half of the loop.
-const SCAN_INTERVAL_MS: u32 = 60;
+/// It cannot go much below this. The search has to succeed at least once before
+/// tracking has anything to track, and a code that fills half the frame at
+/// 1280 wide resolves about seven pixels per module — already under what reads
+/// reliably. Searching cheaper would be searching for something that can never
+/// be found.
+const SEARCH_BUDGET_PX: f64 = 1_300_000.0;
+
+/// Pixel budget once a code is being tracked.
+///
+/// Small, and deliberately applied to a small region: the point of tracking is
+/// to spend the budget on the part of the image that has the code in it. The
+/// same number of pixels over a fifth of the frame is five times the pixels per
+/// module, which is the measurement that decides whether anything decodes.
+const TRACK_BUDGET_PX: f64 = 420_000.0;
+
+/// How much wider than the code the tracked region is drawn.
+///
+/// The devices are held by hand or propped on a table; the code moves between
+/// frames. Too tight and it walks out of the region, which costs a full
+/// re-acquisition — far more than the margin ever costs.
+const ROI_MARGIN: f64 = 0.45;
+
+/// Missed frames tolerated before giving up on the tracked region.
+///
+/// Not one. A single miss is ordinary — a blink of focus hunting, a hand
+/// moving — and throwing the region away for it would mean re-acquiring
+/// constantly at exactly the moment the link is working.
+const ROI_PATIENCE: u32 = 4;
+
+/// How long the scan loop yields between frames, in milliseconds.
+///
+/// A yield, not a throttle. The loop is paced by what capture and decode
+/// actually cost; this only hands control back so the interface can paint and
+/// the code on screen can advance. It used to be sixty, which made sense when a
+/// full-frame scan dominated the cycle — now that a tracked region costs a
+/// fraction of that, sixty milliseconds of deliberate waiting was the largest
+/// single item in the budget.
+const SCAN_INTERVAL_MS: u32 = 10;
 
 /// How often the on-screen code is refreshed, in milliseconds.
 ///
@@ -57,6 +91,19 @@ const DISPLAY_INTERVAL_MS: u32 = 40;
 
 /// How often the status panel refreshes.
 const STATUS_INTERVAL_MS: u32 = 250;
+
+/// A throughput figure, in the unit that keeps it readable.
+///
+/// Bytes per second up to a kilobyte, because on this link that is the range
+/// most of the interesting numbers live in and rounding them to "0.1 kB/s"
+/// would throw away the part worth watching.
+fn rate(bps: f32) -> String {
+    if bps < 1000.0 {
+        format!("{bps:.0} B/s")
+    } else {
+        format!("{:.1} kB/s", bps / 1000.0)
+    }
+}
 
 /// Spaces the authentication digits out.
 ///
@@ -77,6 +124,20 @@ fn spaced(digits: &str) -> String {
 /// Ten seconds for a display that only shows minutes: the point is that it
 /// never sits visibly wrong, not that it is precise.
 const CLOCK_INTERVAL_MS: u32 = 10_000;
+
+/// How long the peer may fail to see us before the transmitter is turned up.
+///
+/// Not instant. Discovery is not symmetric in time — one side always reads the
+/// other first — and reacting to that ordinary gap would drive the brightness
+/// up during every normal handshake.
+const UNSEEN_GRACE_MS: u32 = 2_500;
+
+/// How much of the remaining range one step closes.
+///
+/// Multiplicative, so it moves quickly while the link is badly wrong and
+/// settles as it approaches full output, rather than stepping past the point
+/// where it started working.
+const BOOST_STEP: f32 = 0.35;
 
 /// How often the battery is re-read.
 const BATTERY_INTERVAL_MS: u32 = 60_000;
@@ -200,8 +261,16 @@ async fn request_stream(device: Option<&str>) -> Result<web_sys::MediaStream, Js
     let devices = window().navigator().media_devices()?;
 
     let video_cfg = Object::new();
-    Reflect::set(&video_cfg, &"width".into(), &JsValue::from(CAPTURE_W))?;
-    Reflect::set(&video_cfg, &"height".into(), &JsValue::from(CAPTURE_H))?;
+    // Asked for as ideals, not exact sizes. What actually matters is pixels per
+    // module on the peer's code, so more sensor is better — but a camera that
+    // cannot do this should hand back what it has rather than refuse to open.
+    // Whatever arrives is read back off the video element and used as-is.
+    let width = Object::new();
+    Reflect::set(&width, &"ideal".into(), &JsValue::from(CAPTURE_W))?;
+    Reflect::set(&video_cfg, &"width".into(), &width.into())?;
+    let height = Object::new();
+    Reflect::set(&height, &"ideal".into(), &JsValue::from(CAPTURE_H))?;
+    Reflect::set(&video_cfg, &"height".into(), &height.into())?;
     match device {
         // An explicitly chosen device wins.
         Some(id) => {
@@ -311,6 +380,8 @@ struct Status {
     advice: String,
     pixels_per_module: f32,
     payload_per_frame: usize,
+    offered_bps: f32,
+    delivered_bps: f32,
     sas: Option<String>,
     pairing_expires_in: Option<u64>,
     metrics: Metrics,
@@ -429,6 +500,7 @@ pub fn App() -> impl IntoView {
     let (message, set_message) = signal(String::new());
     let (capture_ms, set_capture_ms) = signal(0.0f64);
     let (transport_ms, set_transport_ms) = signal(0.0f64);
+    let (scan_area, set_scan_area) = signal(String::from("—"));
     let (cameras, set_cameras) = signal(Vec::<(String, String)>::new());
     let (camera_id, set_camera_id) = signal(Option::<String>::None);
     let (dimmable, set_dimmable) = signal(false);
@@ -516,6 +588,57 @@ pub fn App() -> impl IntoView {
         apply_brightness(level);
     };
 
+    // The one closed loop in the interface, and it only ever acts on this end's
+    // own transmitter.
+    //
+    // The condition is deliberately narrow: we can see them and they cannot see
+    // us. That combination rules out the camera, the aim and the distance —
+    // all of which would break both directions — and leaves what this device is
+    // emitting. So it turns its own output up, and stops the moment it is seen.
+    //
+    // It never turns anything down. Being unseen is evidence; being seen is not
+    // evidence that there was too much light, and a loop that hunted in both
+    // directions would oscillate around the threshold it just found.
+    spawn_local(async move {
+        let mut unseen_for = 0u32;
+        loop {
+            gloo_timers::future::TimeoutFuture::new(STATUS_INTERVAL_MS).await;
+            let s = status.get_untracked();
+
+            if !s.sees_peer || s.peer_sees_us {
+                unseen_for = 0;
+                continue;
+            }
+
+            unseen_for += STATUS_INTERVAL_MS;
+            if unseen_for < UNSEEN_GRACE_MS {
+                continue;
+            }
+            unseen_for = 0;
+
+            // The mask first: it costs nothing and works on every platform.
+            let light = code_light.get_untracked();
+            if light < 1.0 {
+                let next = (light + (1.0 - light) * BOOST_STEP).min(1.0);
+                set_code_light.set(next);
+                remember(CODE_LIGHT_KEY, &next.to_string());
+                continue;
+            }
+
+            // Only then the backlight, which is a system setting and belongs to
+            // the user more than the mask does.
+            if dimmable.get_untracked() {
+                let level = brightness.get_untracked();
+                if level < 1.0 {
+                    let next = (level + (1.0 - level) * BOOST_STEP).min(1.0);
+                    set_brightness.set(next);
+                    remember(BRIGHTNESS_KEY, &next.to_string());
+                    apply_brightness(next);
+                }
+            }
+        }
+    });
+
     // The window opens fullscreen every time, so there has to be a way out that
     // is not killing the process.
     let _ = window_event_listener(ev::keydown, move |e| match e.key().as_str() {
@@ -592,21 +715,48 @@ pub fn App() -> impl IntoView {
             let mut r_transport = Rolling::default();
             let mut tick = 0u64;
 
+            // The region currently being tracked, in video pixels. `None` means
+            // searching the whole frame.
+            let mut roi: Option<(f64, f64, f64, f64)> = None;
+            let mut misses = 0u32;
+
             while camera_on.get_untracked() {
                 let (Some(canvas), Some(video)) =
                     (canvas_ref.get_untracked(), video_ref.get_untracked())
                 else {
                     break;
                 };
-                canvas.set_width(CAPTURE_W);
-                canvas.set_height(CAPTURE_H);
+
+                // Whatever the camera actually gave us, which is not
+                // necessarily what was asked for.
+                let vw = f64::from(video.video_width());
+                let vh = f64::from(video.video_height());
+                if vw < 1.0 || vh < 1.0 {
+                    gloo_timers::future::TimeoutFuture::new(SCAN_INTERVAL_MS).await;
+                    continue;
+                }
+
+                let (sx, sy, sw, sh) = roi.unwrap_or((0.0, 0.0, vw, vh));
+
+                // Downscale only as far as the budget demands, never past 1:1.
+                // Scanning a region larger than it was captured invents no
+                // detail and costs real time.
+                let budget = if roi.is_some() {
+                    TRACK_BUDGET_PX
+                } else {
+                    SEARCH_BUDGET_PX
+                };
+                let scale = (budget / (sw * sh)).sqrt().min(1.0);
+                let dw = (sw * scale).round().max(1.0);
+                let dh = (sh * scale).round().max(1.0);
+
+                canvas.set_width(dw as u32);
+                canvas.set_height(dh as u32);
 
                 // `willReadFrequently` matters here more than it usually does.
                 // This loop does nothing but read the canvas back out again,
                 // and without the hint the browser keeps the surface on the GPU
-                // and pays a stall on every `getImageData`. The frame is drawn
-                // once and read once, several times a second, which is the
-                // exact pattern the flag exists for.
+                // and pays a stall on every `getImageData`.
                 let opts = Object::new();
                 let _ = Reflect::set(&opts, &"willReadFrequently".into(), &JsValue::TRUE);
                 let ctx = canvas
@@ -621,42 +771,65 @@ pub fn App() -> impl IntoView {
 
                 let t_capture = now_ms();
                 if ctx
-                    .draw_image_with_html_video_element_and_dw_and_dh(
-                        &video,
-                        0.0,
-                        0.0,
-                        f64::from(CAPTURE_W),
-                        f64::from(CAPTURE_H),
+                    .draw_image_with_html_video_element_and_sw_and_sh_and_dx_and_dy_and_dw_and_dh(
+                        &video, sx, sy, sw, sh, 0.0, 0.0, dw, dh,
                     )
                     .is_err()
                 {
                     gloo_timers::future::TimeoutFuture::new(SCAN_INTERVAL_MS).await;
                     continue;
                 }
-                let Ok(image_data) =
-                    ctx.get_image_data(0.0, 0.0, f64::from(CAPTURE_W), f64::from(CAPTURE_H))
-                else {
+                let Ok(image_data) = ctx.get_image_data(0.0, 0.0, dw, dh) else {
                     gloo_timers::future::TimeoutFuture::new(SCAN_INTERVAL_MS).await;
                     continue;
                 };
                 let rgba = image_data.data();
-                let grey = rgba_to_grey(&rgba, CAPTURE_W, CAPTURE_H);
+                let grey = rgba_to_grey(&rgba, dw as u32, dh as u32);
                 r_capture.push(now_ms() - t_capture);
 
                 // The decode happens here, in front of the boundary rather than
-                // behind it. Nine hundred kilobytes of pixels per frame used to
-                // cross as a raw binary body, which worked on desktop and never
-                // could on Android: its WebView does not expose request bodies,
-                // so Tauri falls back to a text channel and the frame arrives as
-                // anything but bytes. What crosses now is what the decode
-                // produced, which is under a hundred bytes.
+                // behind it. Android's WebView does not expose request bodies,
+                // so a raw binary body cannot cross the IPC bridge at all; what
+                // crosses is what the decode produced, which is under a hundred
+                // bytes.
                 let t_decode = now_ms();
-                let scan = optical_codec::decode::scan_greyscale(
-                    CAPTURE_W as usize,
-                    CAPTURE_H as usize,
-                    &grey,
-                );
+                let scan = optical_codec::decode::scan_greyscale(dw as usize, dh as usize, &grey);
                 let decode_ms = now_ms() - t_decode;
+
+                // Aim the next frame at where this one found something. A code
+                // seen once is almost certainly still nearly there, and scanning
+                // only that neighbourhood is what makes a high capture
+                // resolution affordable rather than ruinous.
+                match scan.best_geometry() {
+                    Some(g) => {
+                        let back = 1.0 / scale;
+                        let xs: Vec<f64> = g.corners.iter().map(|p| f64::from(p.x)).collect();
+                        let ys: Vec<f64> = g.corners.iter().map(|p| f64::from(p.y)).collect();
+                        let lo_x = xs.iter().copied().fold(f64::MAX, f64::min) * back + sx;
+                        let hi_x = xs.iter().copied().fold(f64::MIN, f64::max) * back + sx;
+                        let lo_y = ys.iter().copied().fold(f64::MAX, f64::min) * back + sy;
+                        let hi_y = ys.iter().copied().fold(f64::MIN, f64::max) * back + sy;
+
+                        let pad_x = (hi_x - lo_x) * ROI_MARGIN;
+                        let pad_y = (hi_y - lo_y) * ROI_MARGIN;
+                        let nx = (lo_x - pad_x).max(0.0);
+                        let ny = (lo_y - pad_y).max(0.0);
+                        let nw = (hi_x + pad_x).min(vw) - nx;
+                        let nh = (hi_y + pad_y).min(vh) - ny;
+
+                        if nw > 16.0 && nh > 16.0 {
+                            roi = Some((nx, ny, nw, nh));
+                            misses = 0;
+                        }
+                    }
+                    None => {
+                        misses += 1;
+                        if misses >= ROI_PATIENCE {
+                            roi = None;
+                            misses = 0;
+                        }
+                    }
+                }
 
                 let t_transport = now_ms();
                 let args = Object::new();
@@ -668,15 +841,20 @@ pub fn App() -> impl IntoView {
                 let _ = Reflect::set(&args, &"decodeMs".into(), &JsValue::from_f64(decode_ms));
                 let _ = invoke("on_scan", args.into()).await;
 
-                // Transport is now transport alone: the decode is timed on this
-                // side and reported separately, so neither number hides inside
-                // the other.
+                // Transport is transport alone: the decode is timed on this side
+                // and reported separately, so neither hides inside the other.
                 r_transport.push(now_ms() - t_transport);
 
                 tick += 1;
                 if tick.is_multiple_of(5) {
                     set_capture_ms.set(r_capture.mean());
                     set_transport_ms.set(r_transport.mean());
+                    set_scan_area.set(format!(
+                        "{}x{}{}",
+                        dw as u32,
+                        dh as u32,
+                        if roi.is_some() { " tracked" } else { "" }
+                    ));
                 }
 
                 gloo_timers::future::TimeoutFuture::new(SCAN_INTERVAL_MS).await;
@@ -911,6 +1089,38 @@ pub fn App() -> impl IntoView {
                         // while the screen has room to spare costs throughput
                         // directly — which is why nothing here caps the layout
                         // at a comfortable reading width.
+                        // Both directions at once, above the code and matched
+                        // to its width.
+                        //
+                        // They do not mean the same thing and are not labelled
+                        // as though they do. Down is measured: those bytes
+                        // arrived and decoded. Up is only offered — putting a
+                        // code on screen says nothing about whether anyone read
+                        // it, and calling that "sent" would be the interface
+                        // telling a story the link has not confirmed.
+                        <div
+                            class="flex w-[min(100%,46vh)] items-baseline justify-between \
+                                   gap-3 text-xs tabular-nums landscape:w-[min(100%,74vh)]"
+                        >
+                            <span class="text-dim">
+                                "↑ "
+                                {move || rate(status.get().offered_bps)}
+                                <span class="text-dim/60">" offered"</span>
+                            </span>
+                            <span
+                                class="transition-colors"
+                                class=(
+                                    "text-verified",
+                                    move || status.get().delivered_bps > 0.0,
+                                )
+                                class=("text-dim", move || status.get().delivered_bps <= 0.0)
+                            >
+                                <span class="text-dim/60">"received "</span>
+                                {move || rate(status.get().delivered_bps)}
+                                " ↓"
+                            </span>
+                        </div>
+
                         // Three layers, in this order: the code, then a mask
                         // in front of the whole of it.
                         //
@@ -996,12 +1206,50 @@ pub fn App() -> impl IntoView {
                                 muted=true
                                 playsinline=true
                             ></video>
-                            <Show when=move || !camera_on.get()>
-                                <div
-                                    class="absolute inset-0 flex items-center justify-center p-3 \
-                                           text-center text-xs text-dim sm:text-sm"
-                                >
-                                    "Point this camera at the other screen"
+                            // While the stream is still being negotiated, say so.
+                            // `camera_on` turns true the moment opening starts, which
+                            // is not the same as having a picture yet.
+                            <Show when=move || !streaming.get()>
+                                <div class="absolute inset-0 flex items-center justify-center p-3 text-center text-xs text-dim sm:text-sm">
+                                    {move || {
+                                        if camera_on.get() {
+                                            "Opening the camera…"
+                                        } else {
+                                            "Point this camera at the other screen"
+                                        }
+                                    }}
+                                </div>
+                            </Show>
+
+                            // Once both ends can see each other the preview has done its
+                            // job — aiming is over — and what matters is that the link is
+                            // up.
+                            //
+                            // Laid over the video rather than replacing it. The scan loop
+                            // draws its frames from that element, and a preview that is
+                            // merely covered keeps feeding it while one that is removed
+                            // stops the link. It also means the camera returns the instant
+                            // either check drops, which is exactly when someone needs to
+                            // see what they are pointing at.
+                            <Show when=move || {
+                                let s = status.get();
+                                s.sees_peer && s.peer_sees_us
+                            }>
+                                <div class="absolute inset-0 flex flex-col items-center justify-center gap-1 bg-panel">
+                                    <svg
+                                        class="h-10 w-10 text-verified"
+                                        viewBox="0 0 24 24"
+                                        fill="none"
+                                        stroke="currentColor"
+                                        stroke-width="1.8"
+                                        stroke-linecap="round"
+                                    >
+                                        <rect x="4" y="10.5" width="16" height="10" rx="2.5"></rect>
+                                        <path d="M8 10.5V7a4 4 0 0 1 8 0v3.5"></path>
+                                        <circle cx="12" cy="15.5" r="1.2" fill="currentColor"></circle>
+                                    </svg>
+                                    <p class="text-sm font-medium text-verified">"Linked"</p>
+                                    <p class="text-[0.7rem] text-dim">"Both ends are reading each other"</p>
                                 </div>
                             </Show>
                         </div>
@@ -1115,9 +1363,21 @@ pub fn App() -> impl IntoView {
                                 prop:value=move || code_light.get().to_string()
                                 on:input=on_code_light
                             />
-                            <p class="mt-1 text-[0.7rem] text-dim/70">
+                            <p
+                                class="mt-1 text-[0.7rem] text-dim/70"
+                                class=(
+                                    "text-gold",
+                                    move || {
+                                        let s = status.get();
+                                        s.sees_peer && !s.peer_sees_us
+                                    },
+                                )
+                            >
                                 {move || {
-                                    if code_light.get() < CODE_LIGHT_SAFE {
+                                    let s = status.get();
+                                    if s.sees_peer && !s.peer_sees_us {
+                                        "Turning up — they cannot see this screen yet"
+                                    } else if code_light.get() < CODE_LIGHT_SAFE {
                                         "Below what usually decodes — watch the read rate"
                                     } else {
                                         "Lower it if the peer sees the code but cannot read it"
@@ -1261,6 +1521,10 @@ pub fn App() -> impl IntoView {
                                         m.frames_with_code.saturating_sub(m.frames_decoded),
                                     )
                                 })
+                            />
+                            <Metric
+                                label="Scanning"
+                                value=Signal::derive(move || scan_area.get())
                             />
                             <Metric
                                 label="Capture"

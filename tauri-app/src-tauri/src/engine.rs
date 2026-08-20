@@ -5,7 +5,7 @@
 //! running application — when to change the code on screen, what the camera just
 //! saw, and how the link is performing.
 
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use modem::{Event, Modem};
 use optical_codec::decode::FrameScan;
@@ -27,7 +27,7 @@ use optical_protocol::session::PeerId;
 ///
 /// 120 ms means a 30 fps camera gets roughly three chances at every code. Fewer
 /// than two and a single blurred frame loses the code entirely.
-pub const DEFAULT_HOLD_MS: u64 = 120;
+pub const DEFAULT_HOLD_MS: u64 = 80;
 
 /// How long the pairing code stays on screen, in milliseconds.
 ///
@@ -81,6 +81,14 @@ pub fn starting_mtu() -> usize {
 /// is very slow.
 pub const MINIMUM_MTU: usize = 64;
 
+/// Window the throughput figures are measured over.
+///
+/// Short enough to react while someone is still adjusting the aim, long enough
+/// that a single dropped frame does not read as the link collapsing. A lifetime
+/// average would do neither: it would keep reporting a rate the link had while
+/// it was working, long after it stopped.
+const RATE_WINDOW: Duration = Duration::from_secs(2);
+
 /// What the interface needs to draw itself.
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct Status {
@@ -105,6 +113,14 @@ pub struct Status {
     /// Pixels per module the camera is currently resolving.
     pub pixels_per_module: f32,
     pub payload_per_frame: usize,
+    /// Payload bytes per second this end is putting on screen.
+    ///
+    /// Offered, not confirmed: showing a code says nothing about whether the
+    /// peer read it. The honest counterpart is `delivered_bps`, which counts
+    /// only what this end actually decoded.
+    pub offered_bps: f32,
+    /// Payload bytes per second arriving and decoding successfully.
+    pub delivered_bps: f32,
     /// The digits both users compare, once key agreement has completed.
     pub sas: Option<String>,
     /// Seconds until the pairing code on screen is replaced. `None` once a peer
@@ -160,6 +176,14 @@ pub struct Engine {
     hold_ms: u64,
     metrics: Metrics,
     decode_ms_total: f64,
+    /// Start of the current throughput window, and the counters as they stood
+    /// at that moment.
+    rate_since: Instant,
+    displayed_at_mark: u64,
+    decoded_at_mark: u64,
+    offered_bps: f32,
+    delivered_bps: f32,
+    rate_ticks: u32,
     last_geometry: Option<QrGeometry>,
     last_advice: Advice,
     received: Option<(String, Vec<u8>)>,
@@ -186,6 +210,12 @@ impl Engine {
             hold_ms: DEFAULT_HOLD_MS,
             metrics: Metrics::default(),
             decode_ms_total: 0.0,
+            rate_since: Instant::now(),
+            displayed_at_mark: 0,
+            decoded_at_mark: 0,
+            offered_bps: 0.0,
+            delivered_bps: 0.0,
+            rate_ticks: 0,
             last_geometry: None,
             last_advice: Advice::MoveCloser,
             received: None,
@@ -193,11 +223,49 @@ impl Engine {
         }
     }
 
+    /// Records one line for the history panel, and emits it.
+    ///
+    /// Both, deliberately. The panel is bounded and lives only as long as the
+    /// session, which is right for someone glancing at it mid-transfer and
+    /// useless afterwards; the log survives, is timestamped, and can be read on
+    /// a machine that is not the one that ran it.
     fn note(&mut self, line: impl Into<String>) {
-        self.log.push(line.into());
+        let line = line.into();
+        log::info!("{line}");
+        self.log.push(line);
         if self.log.len() > LOG_CAPACITY {
             self.log.remove(0);
         }
+    }
+
+    /// Writes one line describing the state of the link.
+    ///
+    /// The message is one line in the source on purpose: `cargo fmt` collapses
+    /// a `\`-continued string literal by turning the newline and its indent
+    /// into real spaces, which lands in the log as a gap in the middle of a
+    /// sentence.
+    ///
+    /// Emitted on a slow cadence rather than per frame: at eight frames a
+    /// second a per-frame log is unreadable within a minute and hides the
+    /// thing it was written to expose. What matters when a transfer goes wrong
+    /// is the shape of the numbers over minutes — whether the read rate decayed
+    /// or fell off a cliff, and whether it did so while the code was still
+    /// being seen.
+    fn note_link(&mut self) {
+        let m = self.metrics;
+        self.note(format!(
+            "link: {:?} · read {:.0}% ({}/{}) · unread {} · {:.1} px/mod · {} B/frame · up {:.0} down {:.0} B/s · scan {:.0} ms",
+            self.modem.state(),
+            m.decode_rate * 100.0,
+            m.frames_decoded,
+            m.frames_captured,
+            m.frames_with_code.saturating_sub(m.frames_decoded),
+            self.last_geometry.map_or(0.0, |g| g.pixels_per_module),
+            self.modem.payload_per_frame(),
+            self.offered_bps,
+            self.delivered_bps,
+            m.decode_ms,
+        ));
     }
 
     fn now(&self) -> std::time::Duration {
@@ -238,6 +306,7 @@ impl Engine {
     /// expected: the pacing lives here rather than in the interface, so that the
     /// timing cannot drift with how often the interface happens to poll.
     pub fn current_qr(&mut self) -> &str {
+        self.update_rates();
         let now = self.now();
         for e in self.modem.tick(now) {
             self.absorb(e);
@@ -290,6 +359,35 @@ impl Engine {
         #[allow(clippy::cast_possible_truncation)]
         let decode_ms = (t0.elapsed().as_secs_f64() * 1000.0) as f32;
         self.on_scan(&scan, decode_ms)
+    }
+
+    /// Recomputes throughput if the window has elapsed.
+    ///
+    /// Counted in payload bytes rather than frames, because frames are not what
+    /// anyone is waiting for.
+    fn update_rates(&mut self) {
+        let elapsed = self.rate_since.elapsed();
+        if elapsed < RATE_WINDOW {
+            return;
+        }
+
+        let seconds = elapsed.as_secs_f32();
+        let payload = self.modem.payload_per_frame() as f32;
+        let displayed = self.metrics.frames_displayed - self.displayed_at_mark;
+        let decoded = self.metrics.frames_decoded - self.decoded_at_mark;
+
+        self.offered_bps = displayed as f32 * payload / seconds;
+        self.delivered_bps = decoded as f32 * payload / seconds;
+
+        self.rate_since = Instant::now();
+        self.displayed_at_mark = self.metrics.frames_displayed;
+        self.decoded_at_mark = self.metrics.frames_decoded;
+
+        // Every fifth window, so roughly every ten seconds.
+        self.rate_ticks = self.rate_ticks.wrapping_add(1);
+        if self.rate_ticks.is_multiple_of(5) {
+            self.note_link();
+        }
     }
 
     /// Takes in the result of a scan someone else performed.
@@ -412,6 +510,8 @@ impl Engine {
             advice: self.last_advice.message().to_owned(),
             pixels_per_module: self.last_geometry.map_or(0.0, |g| g.pixels_per_module),
             payload_per_frame: self.modem.payload_per_frame(),
+            offered_bps: self.offered_bps,
+            delivered_bps: self.delivered_bps,
             sas: self.modem.short_auth_string().map(ToOwned::to_owned),
             pairing_expires_in: self
                 .modem
