@@ -6,7 +6,7 @@ name: CI
 # are otherwise only ever checked by hand with two devices on a table.
 on:
   push:
-    branches: [master]
+    branches: [main]
   pull_request:
 
 env:
