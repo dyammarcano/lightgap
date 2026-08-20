@@ -131,6 +131,20 @@ fn spaced(digits: &str) -> String {
 /// never sits visibly wrong, not that it is precise.
 const CLOCK_INTERVAL_MS: u32 = 10_000;
 
+/// Fraction of the frame that may sit at the top of the sensor's range.
+///
+/// Above this the picture is not bright, it is clipped: the peer's screen has
+/// pushed past what the sensor can distinguish and the modules inside it have
+/// merged into one white shape. A person looking at the preview sees a lit
+/// screen and nothing wrong.
+const CLIPPED_LIMIT: f32 = 0.06;
+
+/// Below this mean the frame is too dark to hold a code at all.
+const DARK_MEAN: f32 = 28.0;
+
+/// How much of the exposure range one step covers.
+const EXPOSURE_STEP: f64 = 0.12;
+
 /// How often the transmitter is reconsidered while calibrating down.
 ///
 /// Slower than the status poll, and far slower than the frame rate. Each step
@@ -230,6 +244,41 @@ const CODE_LIGHT_FLOOR: f32 = 0.08;
 /// lower, which is exactly why this marks the value instead of capping it.
 const CODE_LIGHT_SAFE: f32 = 0.45;
 
+/// Moves this end's output by one step, and says whether there was room.
+///
+/// The backlight goes first where it exists, because it moves the light and the
+/// dark together and so keeps the contrast ratio that the mask cannot. The mask
+/// is what is left once there is no backlight to give back.
+///
+/// Returns false when the requested direction has nowhere left to go, which is
+/// what tells a blind sweep it has reached the end and should start over.
+fn step_light(
+    by: f32,
+    dimmable: bool,
+    code_light: ReadSignal<f32>,
+    set_code_light: WriteSignal<f32>,
+    brightness: ReadSignal<f32>,
+    set_brightness: WriteSignal<f32>,
+) -> bool {
+    if dimmable {
+        let level = brightness.get_untracked();
+        let next = (level + by).clamp(0.05, 1.0);
+        if (next - level).abs() > f32::EPSILON {
+            set_brightness.set(next);
+            apply_brightness(next);
+            return true;
+        }
+    }
+
+    let light = code_light.get_untracked();
+    let next = (light + by).clamp(CODE_LIGHT_FLOOR, 1.0);
+    if (next - light).abs() > f32::EPSILON {
+        set_code_light.set(next);
+        return true;
+    }
+    false
+}
+
 /// Pushes a brightness level down to the platform.
 ///
 /// Fire and forget: the interface already shows the level it asked for, and a
@@ -260,6 +309,158 @@ fn forget(key: &str) {
     if let Ok(Some(store)) = window().local_storage() {
         let _ = store.remove_item(key);
     }
+}
+
+/// Moves the camera's exposure to a point in its own range, 0..1.
+///
+/// Fire and forget, and deliberately tolerant: cameras differ in what they
+/// accept and a refusal here is information, not a failure.
+fn apply_exposure(video_ref: NodeRef<leptos::html::Video>, level: f64) {
+    spawn_local(async move {
+        let Some(video) = video_ref.get_untracked() else {
+            return;
+        };
+        let Some(source) = video.src_object() else {
+            return;
+        };
+        let stream: web_sys::MediaStream = source.unchecked_into();
+        let Ok(track) = stream
+            .get_video_tracks()
+            .get(0)
+            .dyn_into::<web_sys::MediaStreamTrack>()
+        else {
+            return;
+        };
+
+        let Some((min, max)) = exposure_range(&track) else {
+            return;
+        };
+        let step = Object::new();
+        let _ = Reflect::set(&step, &"exposureMode".into(), &"manual".into());
+        let _ = Reflect::set(
+            &step,
+            &"exposureTime".into(),
+            &JsValue::from_f64(min + (max - min) * level),
+        );
+        let advanced = js_sys::Array::new();
+        advanced.push(&step);
+        let constraints = Object::new();
+        let _ = Reflect::set(&constraints, &"advanced".into(), &advanced);
+
+        if let Ok(apply) = Reflect::get(&track, &"applyConstraints".into()) {
+            if let Ok(apply) = apply.dyn_into::<js_sys::Function>() {
+                if let Ok(promise) = apply.call1(&track, &constraints) {
+                    if let Ok(promise) = promise.dyn_into::<js_sys::Promise>() {
+                        let _ = JsFuture::from(promise).await;
+                    }
+                }
+            }
+        }
+    });
+}
+
+/// The exposure times this camera will accept, if it accepts any.
+fn exposure_range(track: &web_sys::MediaStreamTrack) -> Option<(f64, f64)> {
+    let caps = Reflect::get(track, &"getCapabilities".into())
+        .ok()?
+        .dyn_into::<js_sys::Function>()
+        .ok()?
+        .call0(track)
+        .ok()?;
+    let range = Reflect::get(&caps, &"exposureTime".into()).ok()?;
+    let min = Reflect::get(&range, &"min".into()).ok()?.as_f64()?;
+    let max = Reflect::get(&range, &"max".into()).ok()?.as_f64()?;
+    (max > min).then_some((min, max))
+}
+
+/// Takes the camera off automatic exposure, as far as it will allow.
+///
+/// This is the one camera setting that matters here, and leaving it alone is
+/// what breaks the link in a dark room. Auto-exposure meters the whole frame;
+/// a dark room drives it wide open; and the one thing in the frame that is not
+/// dark — the peer's screen — clips to flat white with every module inside it
+/// run together. The picture looks fine to a person and carries no code at all.
+///
+/// What a camera will accept varies, and most laptop webcams accept none of it,
+/// so every step is attempted separately and a refusal is not an error. The
+/// capabilities are logged either way: knowing that a camera offers nothing is
+/// worth as much as knowing what it offers, and guessing is what this whole
+/// project is trying to stop doing.
+async fn restrain_exposure(stream: &web_sys::MediaStream) -> bool {
+    let tracks = stream.get_video_tracks();
+    let Some(track) = tracks.get(0).dyn_into::<web_sys::MediaStreamTrack>().ok() else {
+        return false;
+    };
+
+    let caps = Reflect::get(&track, &"getCapabilities".into())
+        .ok()
+        .and_then(|f| f.dyn_into::<js_sys::Function>().ok())
+        .and_then(|f| f.call0(&track).ok());
+    if let Some(caps) = &caps {
+        if let Ok(text) = js_sys::JSON::stringify(caps) {
+            web_sys::console::log_1(&format!("camera capabilities: {text}").into());
+        }
+    }
+
+    let supports = |name: &str| -> bool {
+        caps.as_ref()
+            .and_then(|c| Reflect::get(c, &name.into()).ok())
+            .is_some_and(|v| !v.is_undefined() && !v.is_null())
+    };
+
+    let advanced = js_sys::Array::new();
+    if supports("exposureMode") {
+        let step = Object::new();
+        let _ = Reflect::set(&step, &"exposureMode".into(), &"manual".into());
+        // Toward the short end of whatever the camera offers. The subject is a
+        // lit screen; there is no shortage of light coming from it.
+        if let Some(min) = caps
+            .as_ref()
+            .and_then(|c| Reflect::get(c, &"exposureTime".into()).ok())
+            .and_then(|r| Reflect::get(&r, &"min".into()).ok())
+            .and_then(|v| v.as_f64())
+        {
+            let _ = Reflect::set(&step, &"exposureTime".into(), &JsValue::from_f64(min * 4.0));
+        }
+        advanced.push(&step);
+    }
+    if supports("exposureCompensation") {
+        let step = Object::new();
+        if let Some(min) = caps
+            .as_ref()
+            .and_then(|c| Reflect::get(c, &"exposureCompensation".into()).ok())
+            .and_then(|r| Reflect::get(&r, &"min".into()).ok())
+            .and_then(|v| v.as_f64())
+        {
+            let _ = Reflect::set(
+                &step,
+                &"exposureCompensation".into(),
+                &JsValue::from_f64(min),
+            );
+        }
+        advanced.push(&step);
+    }
+
+    if advanced.length() == 0 {
+        web_sys::console::log_1(
+            &"camera offers no exposure control; a dark room will blow out a screen".into(),
+        );
+        return false;
+    }
+
+    let constraints = Object::new();
+    let _ = Reflect::set(&constraints, &"advanced".into(), &advanced);
+    if let Ok(apply) = Reflect::get(&track, &"applyConstraints".into()) {
+        if let Ok(apply) = apply.dyn_into::<js_sys::Function>() {
+            if let Ok(promise) = apply.call1(&track, &constraints) {
+                if let Ok(promise) = promise.dyn_into::<js_sys::Promise>() {
+                    let _ = JsFuture::from(promise).await;
+                }
+            }
+        }
+    }
+
+    exposure_range(&track).is_some()
 }
 
 /// Asks for a camera stream, optionally pinning one specific device.
@@ -392,6 +593,7 @@ struct Status {
     offered_bps: f32,
     delivered_bps: f32,
     peer_read_quality: Option<f32>,
+    peer_sees_anything: Option<bool>,
     sas: Option<String>,
     pairing_expires_in: Option<u64>,
     metrics: Metrics,
@@ -511,6 +713,9 @@ pub fn App() -> impl IntoView {
     let (capture_ms, set_capture_ms) = signal(0.0f64);
     let (transport_ms, set_transport_ms) = signal(0.0f64);
     let (scan_area, set_scan_area) = signal(String::from("—"));
+    let (clipped, set_clipped) = signal(0.0f32);
+    let (frame_mean, set_frame_mean) = signal(0.0f32);
+    let (exposure, set_exposure) = signal(-1.0f64);
     let (cameras, set_cameras) = signal(Vec::<(String, String)>::new());
     let (camera_id, set_camera_id) = signal(Option::<String>::None);
     let (dimmable, set_dimmable) = signal(false);
@@ -600,90 +805,146 @@ pub fn App() -> impl IntoView {
         apply_brightness(level);
     };
 
+    // The receiving half of the calibration, and the mirror of the one below.
+    //
+    // That one adjusts what this device emits, from what the peer reports. This
+    // one adjusts what this device's camera admits, from what it can measure
+    // for itself — and it can, because a clipped frame is visible in the pixels
+    // without anyone having to say so.
+    //
+    // It only acts while nothing is being read. A link that works is not
+    // improved by moving the exposure, and every move costs a re-acquisition.
+    spawn_local(async move {
+        loop {
+            gloo_timers::future::TimeoutFuture::new(CALIBRATE_INTERVAL_MS).await;
+            if !streaming.get_untracked() {
+                continue;
+            }
+            let s = status.get_untracked();
+            if s.sees_peer {
+                continue;
+            }
+
+            let level = exposure.get_untracked();
+            if level < 0.0 {
+                continue; // this camera offers no exposure control
+            }
+
+            let next = if clipped.get_untracked() > CLIPPED_LIMIT {
+                // Saturated. Nothing in the bright part of this frame can be
+                // told apart, which is exactly where the code is.
+                (level - EXPOSURE_STEP).max(0.0)
+            } else if frame_mean.get_untracked() < DARK_MEAN {
+                (level + EXPOSURE_STEP).min(1.0)
+            } else {
+                continue;
+            };
+
+            if (next - level).abs() > f64::EPSILON {
+                set_exposure.set(next);
+                apply_exposure(video_ref, next);
+            }
+        }
+    });
+
     // The one closed loop in the interface, and it only ever acts on this end's
     // own transmitter.
     //
-    // It descends. Full output is where every session begins, because a link
-    // that does not exist cannot be measured, and being as bright as the
-    // hardware allows is the surest way to be read. From there it gives output
-    // back one step at a time for as long as the peer keeps saying it is
-    // reading well, and takes the last step back when the peer says it is not.
+    // It starts at full output, because a link that does not exist cannot be
+    // measured and being as bright as the hardware allows is the surest way to
+    // be read. What happens next depends on what the peer can tell us, and the
+    // three cases are genuinely different.
     //
-    // Climbing instead would mean spending the whole search invisible, and
-    // worse: the evidence that it should climb is the peer failing to see it,
-    // which is exactly the evidence that cannot arrive when both ends are dim.
-    // Two devices would sit facing each other in the dark, each waiting for the
-    // other to appear first.
+    // The peer reports it is reading well: give output back a step at a time
+    // and find the floor. Cheaper, cooler, and further from the point where a
+    // close-up sensor clips.
     //
-    // The peer's figure is the signal, never our own. Ours measures their
-    // display against our camera; theirs measures our display against their
-    // camera, and it is our display this loop is turning down.
+    // The peer reports it is finding a code and failing to read it: that is too
+    // much light for that camera, not too little. Step down.
+    //
+    // The peer reports nothing at all — which is the case that matters most,
+    // because it is what happens when this display is unreadable enough that
+    // the peer never discovers us and so has nothing to say. Full output is not
+    // automatically right there: a screen at maximum in a dark room saturates a
+    // camera that has auto-exposed for the dark, and every module runs together
+    // into one white rectangle. With no information, sweep: walk down from full
+    // to the floor, and if the floor changes nothing, jump back to full and walk
+    // down again. One of those levels is the one that works, and trying them is
+    // the only way to find out which.
+    //
+    // An earlier version of this comment asserted that being seen is never
+    // evidence of too much light. That is true; what is not true, and what this
+    // got wrong, is that *not* being seen is evidence of too little.
     spawn_local(async move {
         let mut settled = false;
         loop {
             gloo_timers::future::TimeoutFuture::new(CALIBRATE_INTERVAL_MS).await;
             let s = status.get_untracked();
+            let linked = s.sees_peer && s.peer_sees_us;
 
-            // Not linked: go back to what is known to work and start over.
-            if !(s.sees_peer && s.peer_sees_us) {
+            if linked && settled {
+                continue;
+            }
+
+            // Whether to give output back, and why.
+            let descend = if linked {
+                match s.peer_read_quality {
+                    Some(q) if q < RECOVER_BELOW => {
+                        // One step too far. Take it back and stop, rather than
+                        // hunting across the threshold just found.
+                        step_light(
+                            DESCEND_STEP,
+                            dimmable.get_untracked(),
+                            code_light,
+                            set_code_light,
+                            brightness,
+                            set_brightness,
+                        );
+                        settled = true;
+                        continue;
+                    }
+                    Some(q) => q >= DESCEND_ABOVE,
+                    None => continue,
+                }
+            } else {
                 settled = false;
-                if code_light.get_untracked() < 1.0 {
-                    set_code_light.set(1.0);
+                match s.peer_sees_anything {
+                    // Looking and finding nothing: too faint, not too bright.
+                    Some(false) => false,
+                    // Finding a code and unable to read it, or nothing said at
+                    // all. Both are answered by trying less light.
+                    _ => true,
                 }
-                if dimmable.get_untracked() && brightness.get_untracked() < 1.0 {
-                    set_brightness.set(1.0);
-                    apply_brightness(1.0);
-                }
-                continue;
-            }
-
-            if settled {
-                continue;
-            }
-
-            let Some(quality) = s.peer_read_quality else {
-                continue;
             };
 
-            if quality < RECOVER_BELOW {
-                // One step too far. Give it back and stop, rather than hunting
-                // across the threshold that was just found.
-                let light = code_light.get_untracked();
-                if light < 1.0 {
-                    set_code_light.set((light + DESCEND_STEP).min(1.0));
-                } else if dimmable.get_untracked() {
-                    let level = brightness.get_untracked();
-                    set_brightness.set((level + DESCEND_STEP).min(1.0));
-                    apply_brightness((level + DESCEND_STEP).min(1.0));
+            if descend {
+                let reached_floor = !step_light(
+                    -DESCEND_STEP,
+                    dimmable.get_untracked(),
+                    code_light,
+                    set_code_light,
+                    brightness,
+                    set_brightness,
+                );
+                // At the bottom with nothing to show for it, so start again
+                // from the top: the level that works is somewhere in between
+                // and the only way to find it is to pass through it.
+                if reached_floor && !linked {
+                    set_code_light.set(1.0);
+                    if dimmable.get_untracked() {
+                        set_brightness.set(1.0);
+                        apply_brightness(1.0);
+                    }
                 }
-                settled = true;
-                continue;
-            }
-
-            if quality < DESCEND_ABOVE {
-                // Working, but not with enough margin to spend.
-                continue;
-            }
-
-            // The backlight first where it exists: it lowers the light and the
-            // dark together and so keeps the contrast ratio, which the mask
-            // cannot. The mask is what is left once there is no backlight to
-            // give back.
-            if dimmable.get_untracked() {
-                let level = brightness.get_untracked();
-                if level > DESCEND_STEP {
-                    let next = level - DESCEND_STEP;
-                    set_brightness.set(next);
-                    apply_brightness(next);
-                    continue;
-                }
-            }
-
-            let light = code_light.get_untracked();
-            if light - DESCEND_STEP > CODE_LIGHT_SAFE {
-                set_code_light.set(light - DESCEND_STEP);
             } else {
-                settled = true;
+                let _ = step_light(
+                    DESCEND_STEP,
+                    dimmable.get_untracked(),
+                    code_light,
+                    set_code_light,
+                    brightness,
+                    set_brightness,
+                );
             }
         }
     });
@@ -748,6 +1009,13 @@ pub fn App() -> impl IntoView {
                 set_camera_on.set(false);
                 return;
             };
+            // A quarter of the way up the range: the subject is a lit screen,
+            // and there is no shortage of light coming from it.
+            set_exposure.set(if restrain_exposure(&stream).await {
+                0.25
+            } else {
+                -1.0
+            });
             video.set_src_object(Some(&stream));
             let _ = video.play();
             set_streaming.set(true);
@@ -835,6 +1103,29 @@ pub fn App() -> impl IntoView {
                 let rgba = image_data.data();
                 let grey = rgba_to_grey(&rgba, dw as u32, dh as u32);
                 r_capture.push(now_ms() - t_capture);
+
+                // How much of this frame the sensor could not tell apart.
+                //
+                // Sampled rather than counted in full: a sixty-fourth of the
+                // pixels answers the question to far better precision than the
+                // decision needs, and the decision is only made every couple of
+                // seconds.
+                {
+                    let mut clipped = 0u32;
+                    let mut total = 0u32;
+                    let mut sum = 0u32;
+                    for px in grey.iter().step_by(64) {
+                        if *px >= 250 {
+                            clipped += 1;
+                        }
+                        sum += u32::from(*px);
+                        total += 1;
+                    }
+                    if total > 0 {
+                        set_clipped.set(clipped as f32 / total as f32);
+                        set_frame_mean.set(sum as f32 / total as f32);
+                    }
+                }
 
                 // The decode happens here, in front of the boundary rather than
                 // behind it. Android's WebView does not expose request bodies,
@@ -1149,7 +1440,7 @@ pub fn App() -> impl IntoView {
                         // telling a story the link has not confirmed.
                         <div
                             class="flex w-[min(100%,46vh)] items-baseline justify-between \
-                                   gap-3 text-xs tabular-nums landscape:w-[min(100%,74vh)]"
+                                   gap-3 text-xs tabular-nums landscape:w-[min(100%,88vh)]"
                         >
                             <span class="text-dim">
                                 "↑ "
@@ -1180,8 +1471,16 @@ pub fn App() -> impl IntoView {
                         // which replaces whatever children this element has, so
                         // the mask cannot live inside it.
                         <div
-                            class="relative aspect-square w-[min(100%,46vh)] shrink-0 \
-                                   landscape:w-[min(100%,74vh)]"
+                            // Sized against the shorter side of the screen, and as close to
+                            // all of it as the rest of the layout allows.
+                            //
+                            // The old cap left the code using well under half a 1600-pixel
+                            // tall panel while the header and the two caption rows needed
+                            // about 7vh between them. Those spare pixels are not decoration:
+                            // the code is the thing the peer has to resolve, and every one of
+                            // them puts its modules on more of that camera's sensor.
+                            class="relative aspect-square w-[min(100%,52vh)] shrink-0 \
+                                   landscape:w-[min(100%,88vh)]"
                         >
                             <div
                                 // No padding. The encoded image already carries
@@ -1587,6 +1886,21 @@ pub fn App() -> impl IntoView {
                             <Metric
                                 label="Scanning"
                                 value=Signal::derive(move || scan_area.get())
+                            />
+                            <Metric
+                                label="Clipped"
+                                value=Signal::derive(move || percent(clipped.get()))
+                            />
+                            <Metric
+                                label="Exposure"
+                                value=Signal::derive(move || {
+                                    let e = exposure.get();
+                                    if e < 0.0 {
+                                        "camera has none".to_owned()
+                                    } else {
+                                        format!("{:.0}%", e * 100.0)
+                                    }
+                                })
                             />
                             <Metric
                                 label="Capture"

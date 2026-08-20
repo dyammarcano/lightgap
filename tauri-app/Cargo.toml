@@ -37,6 +37,7 @@ features = [
     "MediaStreamTrack",
     "Navigator",
     "Storage",
+    "console",
     "Performance",
     "Window",
 ]

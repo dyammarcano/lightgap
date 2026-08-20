@@ -14,6 +14,9 @@ use optical_codec::decode::FrameScan;
 // in front of the IPC boundary instead.
 #[cfg(test)]
 use optical_codec::decode::scan_greyscale;
+// Only the test-only reference size consults a device profile now; the link
+// itself starts at the floor and learns the rest from the peer.
+#[cfg(test)]
 use optical_codec::device::{suggest_profile, FormFactor, VisualCapabilities};
 use optical_codec::encode::{encode, max_payload, Ecc};
 use optical_codec::geometry::{advise, Advice, QrGeometry};
@@ -67,8 +70,17 @@ pub const DISPLAY_ECC: Ecc = Ecc::Q;
 /// computed at low correction while the engine draws at high, and the code
 /// actually displayed would be denser than the profile assumed — which is how
 /// this was wrong the first time.
+/// The frame size a typical pair of laptops could be expected to manage.
+///
+/// No longer where the link starts — that is [`MINIMUM_MTU`], because a guess
+/// about unseen hardware is a poor thing to transmit before anyone has read
+/// anything. It is kept as the reference the tests hold the encoder against: a
+/// frame of this size has to produce a code a 720p camera can resolve, and if
+/// that ever stops being true the display's correction level and the measured
+/// threshold have drifted apart.
+#[cfg(test)]
 #[must_use]
-pub fn starting_mtu() -> usize {
+pub fn typical_mtu() -> usize {
     let assumed = VisualCapabilities::typical(FormFactor::Laptop);
     suggest_profile(&assumed, &assumed, DISPLAY_ECC)
         .map_or(MINIMUM_MTU, |p| p.payload_bytes.max(MINIMUM_MTU))
@@ -130,6 +142,12 @@ pub struct Status {
     pub offered_bps: f32,
     /// Payload bytes per second arriving and decoding successfully.
     pub delivered_bps: f32,
+    /// Whether the peer is finding any code at all to try to read.
+    ///
+    /// `Some(false)` and a poor quality figure mean opposite things: one says
+    /// this display is too faint or too small for that camera, the other that
+    /// it is too much for it.
+    pub peer_sees_anything: Option<bool>,
     /// How well the peer says it is reading this end, once it has measured.
     ///
     /// The figure that should size and dim this end's transmitter — not our own
@@ -220,7 +238,21 @@ impl Engine {
         getrandom::fill(&mut seed).expect("the OS must provide entropy");
 
         Self {
-            modem: Modem::new(PeerId::from_bytes(seed), starting_mtu()),
+            // Starts at the floor, and climbs from evidence.
+            //
+            // The alternative — and what this used to do — was to compute a
+            // starting size from an assumed laptop with an assumed camera. That
+            // is a guess about hardware nobody has looked at yet, and it fails
+            // in the direction that matters: too large, on the pair where one
+            // camera is worse than assumed, means the first frames are
+            // unreadable, and an unreadable frame produces no measurement for
+            // the controller to work from. The link never starts and never
+            // learns why.
+            //
+            // The floor is readable by anything that can read anything. From
+            // there the peer's own reports say how much larger it can go, which
+            // is the only source of that number that is not speculation.
+            modem: Modem::new(PeerId::from_bytes(seed), MINIMUM_MTU),
             started: Instant::now(),
             current: None,
             current_svg: String::new(),
@@ -234,7 +266,7 @@ impl Engine {
             delivered_bps: 0.0,
             rate_ticks: 0,
             mtu: Aimd::new(
-                starting_mtu() as u32,
+                MINIMUM_MTU as u32,
                 MINIMUM_MTU as u32,
                 // The encoder's ceiling, not a guess at the link's. A code that
                 // large is unreadable in practice and the controller will never
@@ -475,6 +507,7 @@ impl Engine {
         // frames-captured either — a frame with no code in it is not a failure
         // to read, it is nothing to read.
         let seen = self.metrics.frames_with_code - self.with_code_at_mark;
+        self.modem.set_sees_anything(seen > 0);
         if seen > 0 {
             let quality = decoded as f32 / seen as f32;
             self.modem.set_read_quality(quality);
@@ -617,6 +650,7 @@ impl Engine {
             offered_bps: self.offered_bps,
             delivered_bps: self.delivered_bps,
             peer_read_quality: self.modem.peer_read_quality(),
+            peer_sees_anything: self.modem.peer_sees_anything(),
             sas: self.modem.short_auth_string().map(ToOwned::to_owned),
             pairing_expires_in: self
                 .modem
@@ -918,7 +952,7 @@ mod tests {
         // The engine's MTU and the measured pixels-per-module threshold have to
         // agree, or the application starts by transmitting codes its peer cannot
         // read and calibration has no signal to work from.
-        let probe = vec![0u8; starting_mtu()];
+        let probe = vec![0u8; typical_mtu()];
         let modules = encode(&probe, DISPLAY_ECC).expect("a full frame must encode");
 
         // At 720p with the code filling 75% of the height.

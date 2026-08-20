@@ -187,6 +187,17 @@ impl Modem {
         self.session.set_read_quality(fraction);
     }
 
+    /// Records whether this end is finding any code at all to try to read.
+    pub fn set_sees_anything(&mut self, seen: bool) {
+        self.session.set_sees_anything(seen);
+    }
+
+    /// Whether the peer is finding any code at all.
+    #[must_use]
+    pub fn peer_sees_anything(&self) -> Option<bool> {
+        self.session.peer_sees_anything()
+    }
+
     /// How well the peer says it is reading this end.
     #[must_use]
     pub fn peer_read_quality(&self) -> Option<f32> {

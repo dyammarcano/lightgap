@@ -122,7 +122,7 @@ pub const BEACON_LEN: usize = 16;
 /// each end reports what it observes, and the *other* end is the one that acts
 /// on it. Without it, sizing would have to assume the two directions are alike,
 /// which is the one thing this design has said from the start that they are not.
-pub const HELLO_LEN: usize = 16 + ANNOUNCEMENT_LEN + 1;
+pub const HELLO_LEN: usize = 16 + ANNOUNCEMENT_LEN + 2;
 
 /// How long one pairing code stays valid before a fresh ephemeral key is drawn.
 ///
@@ -155,6 +155,18 @@ pub struct Session {
     read_quality: u8,
     /// How well the peer says it is reading this end, if it has said.
     peer_read_quality: Option<u8>,
+    /// Whether this end is finding any code at all in what it photographs.
+    ///
+    /// Separate from the quality figure, and the separation is the whole point.
+    /// Finding a code and failing to read it, and finding nothing whatsoever,
+    /// both come back as a low number — but they are opposite faults with
+    /// opposite remedies. One means the peer's display is too much for this
+    /// camera: too bright, too dense, blooming until the modules run together.
+    /// The other means it is too little: too dim, too small, too far. A peer
+    /// told only "badly" has no way to know which way to move, and half its
+    /// guesses will make things worse.
+    sees_anything: bool,
+    peer_sees_anything: Option<bool>,
     pairing: Pairing,
     pending: Option<Pdu>,
 }
@@ -175,6 +187,8 @@ impl Session {
             peer_sees_us: false,
             read_quality: 0,
             peer_read_quality: None,
+            sees_anything: false,
+            peer_sees_anything: None,
             pairing: Pairing::new(),
             pending: None,
         }
@@ -220,6 +234,21 @@ impl Session {
     /// directions at exactly the moment it can least afford it.
     pub fn set_read_quality(&mut self, fraction: f32) {
         self.read_quality = 1 + (fraction.clamp(0.0, 1.0) * 254.0).round() as u8;
+    }
+
+    /// Records whether this end is finding any code at all to try to read.
+    pub fn set_sees_anything(&mut self, seen: bool) {
+        self.sees_anything = seen;
+    }
+
+    /// Whether the peer is finding any code at all in what it photographs.
+    ///
+    /// `Some(false)` is the useful one: the peer is looking and finding nothing,
+    /// which points at this end's display being too faint or too small rather
+    /// than too much for its camera.
+    #[must_use]
+    pub const fn peer_sees_anything(&self) -> Option<bool> {
+        self.peer_sees_anything
     }
 
     /// How well the peer says it is reading this end.
@@ -330,6 +359,7 @@ impl Session {
                 payload.extend_from_slice(&self.local.0);
                 payload.extend_from_slice(&self.pairing.announcement());
                 payload.push(self.read_quality);
+                payload.push(u8::from(self.sees_anything));
                 payload
             },
         }
@@ -365,12 +395,27 @@ impl Session {
                     // against a peer whose announcement is unintelligible.
                     return events;
                 }
-                let id: [u8; 16] = pdu.payload[..16].try_into().expect("length checked");
-                let peer_public: [u8; 32] = pdu.payload[16..48].try_into().expect("length checked");
-                self.peer_read_quality = Some(pdu.payload[HELLO_LEN - 1]);
-                let peer_nonce: [u8; 16] = pdu.payload[48..HELLO_LEN - 1]
+                // Named offsets rather than arithmetic against the total.
+                //
+                // The nonce used to be cut at `HELLO_LEN - 1`, which was right
+                // until a byte was appended and then quietly asked for
+                // seventeen. Every field here is at a fixed place; deriving one
+                // of them from the length of the whole makes the last field a
+                // load-bearing part of an unrelated one.
+                const PUBLIC: usize = 16;
+                const NONCE: usize = PUBLIC + 32;
+                const QUALITY: usize = NONCE + 16;
+                const SEES: usize = QUALITY + 1;
+
+                let id: [u8; 16] = pdu.payload[..PUBLIC].try_into().expect("length checked");
+                let peer_public: [u8; 32] = pdu.payload[PUBLIC..NONCE]
                     .try_into()
                     .expect("length checked");
+                let peer_nonce: [u8; 16] = pdu.payload[NONCE..QUALITY]
+                    .try_into()
+                    .expect("length checked");
+                self.peer_read_quality = Some(pdu.payload[QUALITY]);
+                self.peer_sees_anything = Some(pdu.payload[SEES] != 0);
                 let remote = PeerId::from_bytes(id);
                 if remote == self.local {
                     // Seeing yourself — a mirror, or your own screen in frame —
@@ -469,6 +514,7 @@ impl Session {
                 self.last_rx = None;
                 self.peer_sees_us = false;
                 self.peer_read_quality = None;
+                self.peer_sees_anything = None;
                 // Keys agreed with a peer that is gone are not keys worth
                 // keeping, and the next code shown should be a fresh one.
                 self.pairing.rotate();
