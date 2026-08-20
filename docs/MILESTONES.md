@@ -1,11 +1,11 @@
 # Milestones
 
-<!-- rev:002 (RFC 3339) 2026-08-20T16:03:37Z -->
+<!-- rev:003 (RFC 3339) 2026-08-20T16:39:27Z -->
 
-No tags have been cut. The versions below describe what was reached, and what
-the next one would need.
+`v0.1.0` is cut. The versions below describe what was reached, and what the
+next one would need.
 
-## v0.1 — a link that exists · reached
+## v0.1.0 — a link that exists · reached, tagged
 
 The full stack, from wire format to two real devices reading each other.
 
