@@ -1,6 +1,6 @@
 # Lightgap — agent instructions
 
-<!-- rev:002 (RFC 3339) 2026-08-20T16:03:45Z -->
+<!-- rev:003 (RFC 3339) 2026-08-20T16:33:41Z -->
 
 An air-gapped multimodal modem: two devices exchange files using only a display
 and a camera. A full transport layer over an optical medium — handshake,
@@ -63,6 +63,12 @@ room for a caption costs throughput.
   older build rejects a new PDU kind as unknown.
 
 ## Style
+
+**English, everywhere.** Code, comments, documentation, commit messages, log
+lines and user-visible strings. The first ten commits are in Spanish and stay
+that way — `refactor: translate the entire codebase to English` is the boundary,
+and rewriting published history to tidy it would cost more than it is worth.
+Nothing after that boundary should need translating again.
 
 Comments explain *why*, and name the failure the code prevents. Tests assert the
 invariant, not the current behaviour — several here were written against a buggy
